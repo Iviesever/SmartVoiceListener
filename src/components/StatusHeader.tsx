@@ -4,6 +4,9 @@ import { WaveformIcon, MicIcon, MicOffIcon, SettingsIcon, BoltIcon } from './Ico
 
 interface StatusHeaderProps {
   state: ListenerState;
+  isCapturing: boolean;
+  isStarting: boolean;
+  isFinalizing: boolean;
   serverOnline: boolean;
   activeModel: string;
   activeModelId: string;
@@ -16,6 +19,9 @@ interface StatusHeaderProps {
 
 export const StatusHeader: React.FC<StatusHeaderProps> = ({
   state,
+  isCapturing,
+  isStarting,
+  isFinalizing,
   serverOnline,
   activeModelId,
   availableModels,
@@ -24,8 +30,6 @@ export const StatusHeader: React.FC<StatusHeaderProps> = ({
   onToggleListening,
   onOpenSettings,
 }) => {
-  const isListening = state !== 'IDLE';
-
   let statusClass = 'status-idle';
   let statusLabel = '未启动';
 
@@ -40,7 +44,17 @@ export const StatusHeader: React.FC<StatusHeaderProps> = ({
     statusLabel = '停顿';
   } else if (state === 'TRANSCRIBING') {
     statusClass = 'status-transcribing';
-    statusLabel = '定稿校正';
+    statusLabel = isFinalizing ? '定稿收尾' : '定稿校正';
+  }
+
+  const isButtonDisabled = isStarting || isFinalizing;
+  let buttonLabel = '开启监听';
+  if (isStarting) {
+    buttonLabel = '启动中...';
+  } else if (isFinalizing) {
+    buttonLabel = '定稿中...';
+  } else if (isCapturing) {
+    buttonLabel = '停止监听';
   }
 
   return (
@@ -79,12 +93,19 @@ export const StatusHeader: React.FC<StatusHeaderProps> = ({
         </div>
 
         <button
-          className={`primary-listen-btn ${isListening ? 'listening' : ''}`}
+          className={`primary-listen-btn ${isCapturing ? 'listening' : ''}`}
           onClick={onToggleListening}
-          title={isListening ? '点击停止语音监听' : '点击开启常驻语音监听'}
+          disabled={isButtonDisabled}
+          title={
+            isFinalizing
+              ? '正在完成剩余段落定稿，请稍候...'
+              : isCapturing
+              ? '点击停止语音监听'
+              : '点击开启常驻语音监听'
+          }
         >
-          {isListening ? <MicOffIcon size={16} /> : <MicIcon size={16} />}
-          <span>{isListening ? '停止监听' : '开启监听'}</span>
+          {isCapturing ? <MicOffIcon size={16} /> : <MicIcon size={16} />}
+          <span>{buttonLabel}</span>
         </button>
 
         <button
@@ -100,10 +121,18 @@ export const StatusHeader: React.FC<StatusHeaderProps> = ({
           style={{
             display: 'inline-flex',
             alignItems: 'center',
-            color: serverOnline ? '#16a34a' : '#94a3b8',
+            gap: 4,
+            padding: '3px 8px',
+            borderRadius: 6,
+            fontSize: '0.75rem',
+            fontWeight: 600,
+            background: serverOnline ? '#ecfdf5' : '#fef2f2',
+            color: serverOnline ? '#059669' : '#dc2626',
+            border: `1px solid ${serverOnline ? '#a7f3d0' : '#fecaca'}`,
           }}
         >
-          <BoltIcon size={17} />
+          <BoltIcon size={13} />
+          <span>{serverOnline ? '8767 就绪' : '服务未启'}</span>
         </div>
       </div>
     </header>

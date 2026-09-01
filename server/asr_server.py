@@ -319,6 +319,16 @@ class ModelManager:
         return ""
 
 
+def normalize_audio_for_inference(samples: np.ndarray) -> np.ndarray:
+    if len(samples) == 0:
+        return samples
+    max_abs = float(np.max(np.abs(samples)))
+    if max_abs > 1e-4:
+        gain = min(4.0, 0.85 / max_abs)
+        return np.clip(samples * gain, -1.0, 1.0).astype(np.float32)
+    return samples
+
+
 # =========================================================================
 # Second-Pass Inference Scheduler (Semaphore & Error Fallback Guard)
 # =========================================================================
@@ -355,9 +365,10 @@ class OfflineInferenceScheduler:
                 if self.model_mgr.loaded_engine_model_id != job.model_id:
                     await asyncio.to_thread(self.model_mgr.load_engine, job.model_id)
 
+                norm_samples = normalize_audio_for_inference(job.samples)
                 # 在后台线程执行推理，不阻塞 asyncio 事件循环
                 text = await asyncio.to_thread(
-                    self.model_mgr.transcribe, job.samples, job.sample_rate
+                    self.model_mgr.transcribe, norm_samples, job.sample_rate
                 )
                 cost_ms = (time.perf_counter() - t0) * 1000
                 final_text = text.strip() if text else job.fallback_text.strip()
@@ -484,7 +495,11 @@ def read_wav_data(data_bytes: bytes):
 
 
 @app.post("/api/asr")
-async def post_legacy_asr(request: Request, file: Optional[UploadFile] = File(None)):
+async def post_legacy_asr(
+    request: Request,
+    file: Optional[UploadFile] = File(None),
+    modelId: Optional[str] = Form(None),
+):
     try:
         if file is not None:
             wav_bytes = await file.read()
@@ -496,13 +511,14 @@ async def post_legacy_asr(request: Request, file: Optional[UploadFile] = File(No
 
         started = time.perf_counter()
         samples, sample_rate = read_wav_data(wav_bytes)
+        norm_samples = normalize_audio_for_inference(samples)
 
-        # 保护：通过 inference_scheduler.semaphore 进行线程与模型隔离保护
-        target_model = model_manager.selected_model_id
+        # 保护：通过 inference_scheduler.semaphore 进行线程与模型隔离保护 (支持指定模型或回退默认模型)
+        target_model = modelId if (modelId and modelId in AVAILABLE_MODELS) else model_manager.selected_model_id
         async with inference_scheduler.semaphore:
             if model_manager.loaded_engine_model_id != target_model:
                 await asyncio.to_thread(model_manager.load_engine, target_model)
-            text = await asyncio.to_thread(model_manager.transcribe, samples, sample_rate)
+            text = await asyncio.to_thread(model_manager.transcribe, norm_samples, sample_rate)
 
         cost_ms = (time.perf_counter() - started) * 1000
         duration_sec = len(samples) / sample_rate
@@ -534,6 +550,7 @@ async def websocket_stream_endpoint(ws: WebSocket):
     stream: Optional[sherpa_onnx.OnlineStream] = streaming_engine.create_stream()
     active_segment_id: Optional[str] = None
     active_session_epoch: int = 1
+    active_segment_model_id: str = model_manager.selected_model_id
     audio_chunks: List[np.ndarray] = []
     last_partial_text: str = ""
     last_revision: int = 0
@@ -548,6 +565,18 @@ async def websocket_stream_endpoint(ws: WebSocket):
             f"model: {result.model_id}, source: {result.final_source}): {result.text}"
         )
         try:
+            # 关键修复 P0-5: 绝不发送空的 Final 回包，避免 Client 误认领
+            if not result.text:
+                await ws.send_json(
+                    {
+                        "type": "error",
+                        "sessionEpoch": result.session_epoch,
+                        "segmentId": result.segment_id,
+                        "message": "Recognition resulted in empty text",
+                    }
+                )
+                return
+
             await ws.send_json(
                 {
                     "type": "final",
@@ -594,6 +623,9 @@ async def websocket_stream_endpoint(ws: WebSocket):
                 elif event_type == "speech_start":
                     active_segment_id = data.get("segmentId", f"seg-{int(time.time()*1000)}")
                     active_session_epoch = data.get("sessionEpoch", 1)
+                    # 关键优化 P1-3: 冻结当前说话段所请求的模型
+                    req_model = data.get("modelId")
+                    active_segment_model_id = req_model if (req_model and req_model in AVAILABLE_MODELS) else model_manager.selected_model_id
                     audio_chunks = []
                     last_partial_text = ""
                     last_revision = 0
@@ -603,9 +635,19 @@ async def websocket_stream_endpoint(ws: WebSocket):
                     seg_id = data.get("segmentId")
                     epoch = data.get("sessionEpoch", active_session_epoch)
 
+                    # 关键优化 P1-4: 告诉 OnlineRecognizer 输入已完成并解码最后尾部余音
+                    if stream is not None and streaming_engine.is_ready:
+                        try:
+                            stream.input_finished()
+                            tail_text = streaming_engine.decode_stream(stream)
+                            if tail_text:
+                                last_partial_text = tail_text
+                        except Exception as flush_err:
+                            print(f"[!] Error flushing stream: {flush_err}", file=sys.stderr)
+
                     if seg_id == active_segment_id and audio_chunks:
                         sealed_audio = np.concatenate(audio_chunks)
-                        captured_model = model_manager.selected_model_id
+                        captured_model = active_segment_model_id
                         job = FinalJob(
                             session_epoch=epoch,
                             segment_id=seg_id,

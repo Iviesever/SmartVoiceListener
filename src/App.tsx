@@ -1,16 +1,14 @@
-import { useState, useRef, useCallback, useEffect } from 'react';
-import { useVoiceListener } from './hooks/useVoiceListener';
+import { useState, useRef, useEffect, useCallback } from 'react';
 import { StatusHeader } from './components/StatusHeader';
 import { DocumentEditor, DocumentEditorHandle } from './components/DocumentEditor/DocumentEditor';
 import { UnreadTranscriptAnchor } from './components/DocumentEditor/UnreadTranscriptAnchor';
 import { SettingsModal } from './components/SettingsModal';
-import { CopyIcon, CheckIcon, DownloadIcon, TrashIcon } from './components/Icons';
+import { useVoiceListener } from './hooks/useVoiceListener';
+import { CopyIcon, DownloadIcon, TrashIcon, CheckIcon } from './components/Icons';
 import { loadSavedDocument, saveDocumentContent } from './services/storageService';
 
-export default function App() {
+export function App() {
   const editorRef = useRef<DocumentEditorHandle | null>(null);
-
-  // 初始加载历史保存文档
   const initialDocumentRef = useRef<string>(loadSavedDocument());
   const latestDocRef = useRef<string>(initialDocumentRef.current);
 
@@ -59,6 +57,9 @@ export default function App() {
 
   const {
     state,
+    isCapturing,
+    isStarting,
+    isFinalizing,
     volume,
     pauseCountdown,
     vadConfig,
@@ -79,13 +80,16 @@ export default function App() {
     onTranscriptCancelled: handleTranscriptCancelled,
   });
 
-  // 监听 pagehide 与 visibilitychange，在刷新/关闭/切后台时同步立即落盘文档
+  // 关键修复 P0-6: 监听 pagehide 与 visibilitychange，先同步 flush editor 待提交队列再落盘文档
   useEffect(() => {
     const handleImmediateFlush = () => {
       if (saveTimerRef.current) {
         clearTimeout(saveTimerRef.current);
       }
-      saveDocumentContent(latestDocRef.current);
+      const flushed = editorRef.current?.flushPendingTranscriptsNow();
+      const textToSave = flushed !== undefined ? flushed : latestDocRef.current;
+      latestDocRef.current = textToSave;
+      saveDocumentContent(textToSave);
     };
 
     const handleVisibilityChange = () => {
@@ -148,23 +152,29 @@ export default function App() {
 
   // 状态栏动态指示文案
   let statusDetail = '就绪';
-  if (state === 'LISTENING_SILENCE') {
+  if (isFinalizing) {
+    statusDetail = `${activeModel} 正在完成最后定稿收尾...`;
+  } else if (state === 'LISTENING_SILENCE') {
     statusDetail = streamingReady
       ? '正在监听环境音 (开口说话自动捕捉)'
       : '正在监听环境音 (流式引擎未就绪，使用离线定稿)';
-  }
-  if (state === 'SPEAKING_ACTIVE') statusDetail = '正在实时流式识别 (Partial)...';
-  if (state === 'PAUSE_WAITING') {
+  } else if (state === 'SPEAKING_ACTIVE') {
+    statusDetail = '正在实时流式识别 (Partial)...';
+  } else if (state === 'PAUSE_WAITING') {
     const sec = (pauseCountdown / 1000).toFixed(1);
     statusDetail = `停顿检测 (${sec}s 后自动二阶段定稿)`;
+  } else if (state === 'TRANSCRIBING') {
+    statusDetail = `${activeModel} 大模型正在二阶段高精校正...`;
   }
-  if (state === 'TRANSCRIBING') statusDetail = `${activeModel} 大模型正在二阶段高精校正...`;
 
   return (
     <div className="app-container">
       {/* 顶部极简主控栏 */}
       <StatusHeader
         state={state}
+        isCapturing={isCapturing}
+        isStarting={isStarting}
+        isFinalizing={isFinalizing}
         serverOnline={serverOnline}
         activeModel={activeModel}
         activeModelId={activeModelId}
@@ -198,34 +208,33 @@ export default function App() {
           <span className="status-text">{statusDetail}</span>
         </div>
 
-        <div className="footer-actions-group">
-          <span className="char-counter">字数: {charCount}</span>
+        <div className="status-actions-group">
+          <span className="char-counter">{charCount} 字</span>
+
+          <div className="divider-v" />
 
           <button
-            className={`action-pill-btn ${isCopied ? 'copied' : ''}`}
+            className="action-link-btn"
             onClick={handleCopyFullText}
-            title="一键复制文档全文"
-            disabled={charCount === 0}
+            title="复制全文内容"
           >
             {isCopied ? <CheckIcon size={14} /> : <CopyIcon size={14} />}
             <span>{isCopied ? '已复制' : '复制全文'}</span>
           </button>
 
           <button
-            className="action-pill-btn"
+            className="action-link-btn"
             onClick={handleExportDocument}
-            title="导出为 Markdown 文件"
-            disabled={charCount === 0}
+            title="导出为 Markdown 格式文档"
           >
             <DownloadIcon size={14} />
-            <span>导出</span>
+            <span>导出文档</span>
           </button>
 
           <button
-            className="action-pill-btn danger"
+            className="action-link-btn danger"
             onClick={handleClearAll}
-            title="清空当前文档"
-            disabled={charCount === 0}
+            title="清空当前文档所有内容"
           >
             <TrashIcon size={14} />
             <span>清空</span>
@@ -233,13 +242,15 @@ export default function App() {
         </div>
       </footer>
 
-      {/* 监听参数调节弹窗 */}
+      {/* 监听参数调节抽屉/模态框 */}
       <SettingsModal
         isOpen={isSettingsOpen}
-        onClose={() => setIsSettingsOpen(false)}
         config={vadConfig}
+        onClose={() => setIsSettingsOpen(false)}
         onSave={updateVadConfig}
       />
     </div>
   );
 }
+
+export default App;

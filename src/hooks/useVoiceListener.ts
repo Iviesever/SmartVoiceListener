@@ -13,6 +13,7 @@ interface UseVoiceListenerOptions {
 
 export function useVoiceListener(options?: UseVoiceListenerOptions) {
   const [captureState, setCaptureState] = useState<'IDLE' | 'LISTENING_SILENCE' | 'SPEAKING_ACTIVE' | 'PAUSE_WAITING'>('IDLE');
+  const [isStarting, setIsStarting] = useState<boolean>(false);
   const [pendingFinalCount, setPendingFinalCount] = useState<number>(0);
   const [volume, setVolume] = useState<number>(0);
   const [pauseCountdown, setPauseCountdown] = useState<number>(0);
@@ -25,6 +26,9 @@ export function useVoiceListener(options?: UseVoiceListenerOptions) {
   const [isSwitchingModel, setIsSwitchingModel] = useState<boolean>(false);
   const [segments, setSegments] = useState<TranscriptSegment[]>(() => loadSavedSegments());
 
+  // 关键修复 P0-1: 确切的待定稿 SegmentId 集合 (Single Source of Truth)
+  const pendingFinalIdsRef = useRef<Set<string>>(new Set());
+
   // 全局会话世代 (Session Epoch)，在清空、新开启时递增
   const sessionEpochRef = useRef<number>(1);
   const engineRef = useRef<AudioCaptureEngine | null>(null);
@@ -33,7 +37,29 @@ export function useVoiceListener(options?: UseVoiceListenerOptions) {
   const optionsRef = useRef(options);
   optionsRef.current = options;
 
-  // 状态优先级推导：SPEAKING/PAUSE > TRANSCRIBING (存在待定稿队列) > LISTENING_SILENCE > IDLE
+  // 辅助函数：原子增减 pendingFinalIds
+  const markPending = useCallback((segmentId: string) => {
+    pendingFinalIdsRef.current.add(segmentId);
+    setPendingFinalCount(pendingFinalIdsRef.current.size);
+  }, []);
+
+  const settlePending = useCallback((segmentId: string) => {
+    if (pendingFinalIdsRef.current.has(segmentId)) {
+      pendingFinalIdsRef.current.delete(segmentId);
+      setPendingFinalCount(pendingFinalIdsRef.current.size);
+    }
+  }, []);
+
+  const clearAllPending = useCallback(() => {
+    pendingFinalIdsRef.current.clear();
+    setPendingFinalCount(0);
+  }, []);
+
+  // 状态拆分 P0-1 & P0-2
+  const isCapturing = captureState !== 'IDLE';
+  const isFinalizing = !isCapturing && pendingFinalCount > 0;
+
+  // UI 展示状态
   const state: ListenerState = useMemo(() => {
     if (captureState === 'IDLE') {
       return pendingFinalCount > 0 ? 'TRANSCRIBING' : 'IDLE';
@@ -102,7 +128,7 @@ export function useVoiceListener(options?: UseVoiceListenerOptions) {
   useEffect(() => {
     return () => {
       sessionEpochRef.current += 1;
-      engineRef.current?.dispose();
+      engineRef.current?.abortAndDispose();
       engineRef.current = null;
       segmentsRef.current.forEach((s) => {
         if (s.audioBlobUrl?.startsWith('blob:')) {
@@ -119,6 +145,9 @@ export function useVoiceListener(options?: UseVoiceListenerOptions) {
       const ok = await switchActiveModel(modelId);
       if (ok) {
         await refreshServerStatus();
+        if (engineRef.current) {
+          engineRef.current.activeModelId = modelId;
+        }
       } else {
         alert(`切换模型 ${modelId} 失败，请检查模型文件是否存在！`);
       }
@@ -129,18 +158,25 @@ export function useVoiceListener(options?: UseVoiceListenerOptions) {
     }
   }, [refreshServerStatus]);
 
-  // 启动常驻双通道流式监听
+  // 启动常驻双通道流式监听 (带互斥与安全初始化)
   const startListening = useCallback(async () => {
+    // 关键优化 P0-2: 如果正在启动中或处于旧段落 draining 定稿中，禁止重复启动
+    if (isStarting || (captureState === 'IDLE' && pendingFinalIdsRef.current.size > 0)) {
+      return;
+    }
+
+    setIsStarting(true);
     try {
       if (engineRef.current) {
-        engineRef.current.dispose();
+        engineRef.current.abortAndDispose();
+        engineRef.current = null;
       }
 
       sessionEpochRef.current += 1;
       const currentSession = sessionEpochRef.current;
-      setPendingFinalCount(0);
+      clearAllPending();
 
-      const engine = new AudioCaptureEngine(vadConfig);
+      const engine = new AudioCaptureEngine(vadConfig, activeModelId);
 
       // 0. WebSocket 握手就绪与连接状态回调
       engine.transport.onStreamReady = (_sampleRate, ready) => {
@@ -165,17 +201,17 @@ export function useVoiceListener(options?: UseVoiceListenerOptions) {
         setPauseCountdown(remainingMs);
       };
 
-      // 3. 说话结束回调（流式结束，等待 Second-Pass 定稿）
+      // 3. 说话结束回调（流式结束，加入精确待定稿集合）
       engine.onSpeakingEnd = (segmentId) => {
         setCaptureState('LISTENING_SILENCE');
         setPauseCountdown(0);
-        setPendingFinalCount((prev) => prev + 1);
+        markPending(segmentId);
         optionsRef.current?.onTranscriptSpeechEnd?.(segmentId);
       };
 
-      // 3.1 说话取消回调 (短噪声 < 450ms 过滤或主动取消)
+      // 3.1 说话取消回调 (短噪声 < 180ms 过滤或主动取消)
       engine.onSpeakingCancel = (segmentId) => {
-        setPendingFinalCount((prev) => Math.max(0, prev - 1));
+        settlePending(segmentId);
         optionsRef.current?.onTranscriptCancelled?.(segmentId);
       };
 
@@ -192,7 +228,7 @@ export function useVoiceListener(options?: UseVoiceListenerOptions) {
 
       // 6. 二阶段 Final 定稿文本到达 (安全携带 cachedData 真实时间戳与 PCM)
       engine.onFinal = (event, cachedData) => {
-        setPendingFinalCount((prev) => Math.max(0, prev - 1));
+        settlePending(event.segmentId);
 
         if (event.sessionEpoch !== sessionEpochRef.current) {
           console.log('[ASR] Discarding stale Final due to session epoch change:', event.text);
@@ -200,7 +236,7 @@ export function useVoiceListener(options?: UseVoiceListenerOptions) {
           return;
         }
 
-        const trimmed = event.text.trim();
+        const trimmed = event.text ? event.text.trim() : '';
         if (trimmed) {
           let audioUrl: string | undefined = undefined;
           if (cachedData?.pcm) {
@@ -237,8 +273,8 @@ export function useVoiceListener(options?: UseVoiceListenerOptions) {
       };
 
       engine.onError = (event) => {
-        setPendingFinalCount((prev) => Math.max(0, prev - 1));
         if (event.segmentId) {
+          settlePending(event.segmentId);
           optionsRef.current?.onTranscriptCancelled?.(event.segmentId);
         }
         console.warn('[ASR] Stream error event:', event);
@@ -246,8 +282,9 @@ export function useVoiceListener(options?: UseVoiceListenerOptions) {
 
       await engine.start(currentSession);
 
+      // 若在启动异步过程中用户切换了世代，安全放弃
       if (currentSession !== sessionEpochRef.current) {
-        engine.dispose();
+        engine.abortAndDispose();
         return;
       }
 
@@ -257,10 +294,12 @@ export function useVoiceListener(options?: UseVoiceListenerOptions) {
       console.error('Failed to start AudioCaptureEngine:', err);
       alert('启动麦克风失败，请检查浏览器麦克风权限！');
       setCaptureState('IDLE');
+    } finally {
+      setIsStarting(false);
     }
-  }, [vadConfig, activeModelId]);
+  }, [isStarting, captureState, vadConfig, activeModelId, markPending, settlePending, clearAllPending]);
 
-  // 停止监听 (优雅停止麦克风采集，但允许当前已说出口的最后一句完成定稿与落库)
+  // 停止监听 (优雅停止麦克风采集，但保留已录制段落的定稿结算权)
   const stopListening = useCallback(() => {
     setCaptureState('IDLE');
     setVolume(0);
@@ -268,7 +307,7 @@ export function useVoiceListener(options?: UseVoiceListenerOptions) {
     setStreamingReady(false);
 
     if (engineRef.current) {
-      engineRef.current.stopCapture();
+      engineRef.current.stopCaptureGracefully();
       if (engineRef.current.localSegmentCache.size === 0) {
         engineRef.current = null;
       }
@@ -277,17 +316,18 @@ export function useVoiceListener(options?: UseVoiceListenerOptions) {
 
   // 切换监听状态
   const toggleListening = useCallback(() => {
-    if (captureState === 'IDLE') {
-      void startListening();
-    } else {
+    if (isStarting || isFinalizing) return;
+    if (isCapturing) {
       stopListening();
+    } else {
+      void startListening();
     }
-  }, [captureState, startListening, stopListening]);
+  }, [isStarting, isFinalizing, isCapturing, startListening, stopListening]);
 
   // 清空文档与后台 Segments (原子重置会话世代，取消飞行中的所有录音)
   const resetWorkspace = useCallback(() => {
     sessionEpochRef.current += 1;
-    setPendingFinalCount(0);
+    clearAllPending();
 
     if (engineRef.current) {
       engineRef.current.resetSession(sessionEpochRef.current);
@@ -303,7 +343,7 @@ export function useVoiceListener(options?: UseVoiceListenerOptions) {
     segmentsRef.current = [];
     setSegments([]);
     saveSegments([]);
-  }, []);
+  }, [clearAllPending]);
 
   // 更新设置
   const updateVadConfig = useCallback((newConfig: Partial<VadConfig>) => {
@@ -316,6 +356,10 @@ export function useVoiceListener(options?: UseVoiceListenerOptions) {
 
   return {
     state,
+    isCapturing,
+    isStarting,
+    isFinalizing,
+    pendingFinalCount,
     segments,
     volume,
     pauseCountdown,

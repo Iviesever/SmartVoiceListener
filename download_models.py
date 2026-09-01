@@ -23,27 +23,12 @@ def download_file(url, target_path):
     urllib.request.urlretrieve(url, target_path, reporthook)
     sys.stdout.write("\n")
 
-# 1. 下载 Silero VAD 模型 (用于说话起止活动检测，仅约 2MB)
-vad_model_path = MODELS_DIR / "silero_vad.onnx"
-if not vad_model_path.exists():
-    vad_urls = [
-        "https://ghproxy.net/https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/silero_vad.onnx",
-        "https://hf-mirror.com/csukuangfj/sherpa-onnx-vad-models/resolve/main/silero_vad.onnx",
-        "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/silero_vad.onnx"
-    ]
-    for u in vad_urls:
-        try:
-            download_file(u, vad_model_path)
-            if vad_model_path.stat().st_size > 1000:
-                print(f"[✓] Silero VAD ready ({vad_model_path.stat().st_size / 1024:.1f} KB)")
-                break
-        except Exception as e:
-            print(f"[-] Failed with {u}: {e}")
-
-# 2. 下载 SenseVoice ONNX 模型包
+# 1. 下载 SenseVoice ONNX 模型包 (model.int8.onnx + tokens.txt)
 sensevoice_dir = MODELS_DIR / "sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17"
 sensevoice_model_file = sensevoice_dir / "model.int8.onnx"
-if not sensevoice_model_file.exists():
+sensevoice_tokens_file = sensevoice_dir / "tokens.txt"
+
+if not (sensevoice_model_file.exists() and sensevoice_tokens_file.exists()):
     tar_path = MODELS_DIR / "sense-voice.tar.bz2"
     sensevoice_urls = [
         "https://ghproxy.net/https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17.tar.bz2",
@@ -63,7 +48,7 @@ if not sensevoice_model_file.exists():
         except Exception as e:
             print(f"[-] Failed with {u}: {e}")
 
-# 3. 下载 Streaming Paraformer INT8 模型 (用于 First-Pass 实时流式识别)
+# 2. 下载 Streaming Paraformer INT8 模型 (用于 First-Pass 实时流式识别)
 paraformer_dir = MODELS_DIR / "sherpa-onnx-streaming-paraformer-bilingual-zh-en"
 paraformer_encoder = paraformer_dir / "encoder.int8.onnx"
 paraformer_decoder = paraformer_dir / "decoder.int8.onnx"
@@ -104,3 +89,8 @@ for item in MODELS_DIR.rglob("*"):
     if item.is_file():
         print(f" - {item.relative_to(MODELS_DIR)} ({item.stat().st_size / (1024*1024):.2f} MB)")
 
+if not (sensevoice_model_file.exists() and sensevoice_tokens_file.exists()):
+    print("[!] ERROR: SenseVoice model files are still incomplete!", file=sys.stderr)
+    sys.exit(1)
+
+sys.exit(0)

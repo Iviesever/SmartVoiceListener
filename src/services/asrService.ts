@@ -2,31 +2,54 @@ import { ModelInfo } from '../types';
 
 export const DEFAULT_ASR_PORT = 8767;
 
-export function getAsrEndpointCandidates(): string[] {
-  const candidates: string[] = [];
-  
+/**
+ * 统一解析 ASR 服务的 Base HTTP URL (兼容 custom url, location hostname, http/https)
+ */
+export function getAsrHttpBaseUrl(): string {
   if (typeof window !== 'undefined') {
     const customUrl = localStorage.getItem('smart-voice-asr-url');
-    if (customUrl) candidates.push(customUrl);
+    if (customUrl) {
+      return customUrl.replace(/\/api\/.*$/, '').replace(/\/+$/, '');
+    }
 
     if (window.location?.hostname) {
       const proto = window.location.protocol === 'https:' ? 'https:' : 'http:';
       const host = window.location.hostname;
-      candidates.push(`${proto}//${host}:${DEFAULT_ASR_PORT}/api/asr`);
-      if (host !== '127.0.0.1' && host !== 'localhost') {
-        candidates.push(`http://127.0.0.1:${DEFAULT_ASR_PORT}/api/asr`);
-      }
-    } else {
+      return `${proto}//${host}:${DEFAULT_ASR_PORT}`;
+    }
+  }
+  return `http://127.0.0.1:${DEFAULT_ASR_PORT}`;
+}
+
+/**
+ * 统一由 HTTP Base URL 推导 WebSocket URL (http->ws, https->wss)
+ */
+export function getAsrWsUrl(): string {
+  const httpBase = getAsrHttpBaseUrl();
+  const wsProto = httpBase.startsWith('https:') ? 'wss:' : 'ws:';
+  const hostAndPort = httpBase.replace(/^https?:\/\//, '');
+  return `${wsProto}//${hostAndPort}/api/stream`;
+}
+
+export function getAsrEndpointCandidates(): string[] {
+  const base = getAsrHttpBaseUrl();
+  const candidates: string[] = [`${base}/api/asr`];
+
+  if (typeof window !== 'undefined' && window.location?.hostname) {
+    const host = window.location.hostname;
+    if (host !== '127.0.0.1' && host !== 'localhost') {
       candidates.push(`http://127.0.0.1:${DEFAULT_ASR_PORT}/api/asr`);
     }
-  } else {
-    candidates.push(`http://127.0.0.1:${DEFAULT_ASR_PORT}/api/asr`);
   }
-
   return [...new Set(candidates)];
 }
 
-export async function checkAsrHealth(): Promise<{ online: boolean; model?: string; activeModelId?: string }> {
+export async function checkAsrHealth(): Promise<{
+  online: boolean;
+  model?: string;
+  activeModelId?: string;
+  streamingEngineReady?: boolean;
+}> {
   const candidates = getAsrEndpointCandidates();
   for (const url of candidates) {
     try {
@@ -38,6 +61,7 @@ export async function checkAsrHealth(): Promise<{ online: boolean; model?: strin
           online: true,
           model: data.model || 'SenseVoice',
           activeModelId: data.activeModelId,
+          streamingEngineReady: data.streamingEngineReady,
         };
       }
     } catch {
@@ -85,10 +109,16 @@ export async function switchActiveModel(modelId: string): Promise<boolean> {
   return false;
 }
 
-export async function transcribeAudioBlob(wavBlob: Blob): Promise<{ text: string; modelId?: string }> {
+export async function transcribeAudioBlob(
+  wavBlob: Blob,
+  modelId?: string
+): Promise<{ text: string; modelId?: string }> {
   const candidates = getAsrEndpointCandidates();
   const formData = new FormData();
   formData.append('file', wavBlob, 'audio.wav');
+  if (modelId) {
+    formData.append('modelId', modelId);
+  }
 
   for (const url of candidates) {
     try {

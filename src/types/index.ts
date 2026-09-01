@@ -18,6 +18,7 @@ export interface LocalSegmentData {
   readonly durationMs: number;
   readonly startedAt: number;
   readonly endedAt: number;
+  readonly modelId?: string;
 }
 
 // 底层不可变 Segment 数据层（投影到文档，保留原始不可变 ASR 证据）

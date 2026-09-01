@@ -58,7 +58,11 @@ const allModelsPresent =
 if (!allModelsPresent) {
   console.log(yellow('[提示] 检测到模型文件不完整，正在自动补全/拉取模型...'));
   const pyCmd = isWin ? 'python' : 'python3';
-  spawnSync(pyCmd, ['download_models.py'], { cwd: rootDir, stdio: 'inherit' });
+  const dlRes = spawnSync(pyCmd, ['download_models.py'], { cwd: rootDir, stdio: 'inherit' });
+  if (dlRes.status !== 0) {
+    console.log(red('[错误] download_models.py 执行失败，请检查网络连接！'));
+    process.exit(1);
+  }
 }
 
 // 3. 查找支持 GPU (CUDA) 的最佳 Python 解释器

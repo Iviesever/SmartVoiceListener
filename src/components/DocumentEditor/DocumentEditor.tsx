@@ -10,6 +10,7 @@ export interface DocumentEditorHandle {
   sealStreamingPartial: (segmentId: string) => void;
   commitStreamingFinal: (segmentId: string, finalText: string) => void;
   clearStreamingPartial: (segmentId?: string) => void;
+  flushPendingTranscriptsNow: () => string;
   clearContent: () => void;
   getContent: () => string;
   scrollToBottom: () => void;
@@ -448,17 +449,31 @@ export const DocumentEditor = forwardRef<DocumentEditorHandle, DocumentEditorPro
       [instantScrollToBottom, isUserActivelyEditingTail, schedulePendingFlushAfterIdle]
     );
 
-    // 清空指定或全部流式投影
+    // 清空指定或全部流式投影 (关键修复 P0-6: 同步清除 pendingTranscripts 中对应 segmentId，避免 Cancel 后幽灵文本再次刷入)
     const clearStreamingPartial = useCallback((segmentId?: string) => {
       const view = editorViewRef.current;
       if (!view) return;
 
       if (segmentId) {
+        pendingTranscriptsRef.current = pendingTranscriptsRef.current.filter(
+          (item) => item.segmentId !== segmentId
+        );
         view.dispatch({ effects: commitStreamingFinalEffect.of(segmentId) });
       } else {
+        pendingTranscriptsRef.current = [];
         view.dispatch({ effects: clearAllStreamingEffect.of() });
       }
     }, []);
+
+    // 立即同步清空与提交所有待写入队列 (用于 pagehide/切后台时同步落盘)
+    const flushPendingTranscriptsNow = useCallback(() => {
+      if (tailEditTimerRef.current) {
+        clearTimeout(tailEditTimerRef.current);
+        tailEditTimerRef.current = null;
+      }
+      flushPendingTranscripts();
+      return editorViewRef.current?.state.doc.toString() || '';
+    }, [flushPendingTranscripts]);
 
     // 辅助函数：创建统一配置的 EditorState
     const createNewEditorState = useCallback((content: string) => {
@@ -524,6 +539,7 @@ export const DocumentEditor = forwardRef<DocumentEditorHandle, DocumentEditorPro
         sealStreamingPartial,
         commitStreamingFinal,
         clearStreamingPartial,
+        flushPendingTranscriptsNow,
         clearContent,
         getContent,
         scrollToBottom,
@@ -534,6 +550,7 @@ export const DocumentEditor = forwardRef<DocumentEditorHandle, DocumentEditorPro
         sealStreamingPartial,
         commitStreamingFinal,
         clearStreamingPartial,
+        flushPendingTranscriptsNow,
         clearContent,
         getContent,
         scrollToBottom,
