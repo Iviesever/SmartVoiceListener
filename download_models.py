@@ -89,8 +89,11 @@ for item in MODELS_DIR.rglob("*"):
     if item.is_file():
         print(f" - {item.relative_to(MODELS_DIR)} ({item.stat().st_size / (1024*1024):.2f} MB)")
 
-if not (sensevoice_model_file.exists() and sensevoice_tokens_file.exists()):
-    print("[!] ERROR: SenseVoice model files are still incomplete!", file=sys.stderr)
+sensevoice_ok = sensevoice_model_file.exists() and sensevoice_tokens_file.exists()
+paraformer_ok = paraformer_encoder.exists() and paraformer_decoder.exists() and paraformer_tokens.exists()
+
+if not (sensevoice_ok and paraformer_ok):
+    print("[!] ERROR: Model files are incomplete (SenseVoice or Paraformer missing)!", file=sys.stderr)
     sys.exit(1)
 
 sys.exit(0)

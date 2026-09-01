@@ -35,7 +35,7 @@ if (!existsSync(nodeModulesPath)) {
   console.log(green('[成功] 前端依赖安装完成！\n'));
 }
 
-// 2. 检查模型文件完整性 (Mandatory: SenseVoice; Optional: Streaming Paraformer)
+// 2. 检查模型文件完整性 (流式 Paraformer 与定稿 SenseVoice 均为系统启动必要底座)
 const modelsDir = resolve(rootDir, 'models');
 const sensevoiceDir = resolve(modelsDir, 'sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17');
 const sensevoiceModel = existsSync(resolve(sensevoiceDir, 'model.int8.onnx')) || existsSync(resolve(sensevoiceDir, 'model.onnx'));
@@ -48,36 +48,28 @@ const paraformerDecoder = existsSync(resolve(paraformerDir, 'decoder.int8.onnx')
 const paraformerTokens = existsSync(resolve(paraformerDir, 'tokens.txt'));
 const streamingReady = paraformerEncoder && paraformerDecoder && paraformerTokens;
 
-const skipStreamingDownload =
-  process.env.SMARTVOICE_SKIP_STREAMING_MODEL_DOWNLOAD === '1' ||
-  existsSync(resolve(modelsDir, '.skip_streaming_download'));
-
-const shouldDownload = !senseVoiceReady || (!streamingReady && !skipStreamingDownload);
-
-if (shouldDownload) {
-  console.log(yellow('[提示] 检测到模型文件不完整，正在尝试自动补全/拉取模型...'));
+if (!senseVoiceReady || !streamingReady) {
+  console.log(yellow('[提示] 检测到模型文件不完整，正在自动补全/拉取模型...'));
   const pyCmd = isWin ? 'python' : 'python3';
   const dlRes = spawnSync(pyCmd, ['download_models.py'], { cwd: rootDir, stdio: 'inherit' });
   if (dlRes.status !== 0) {
-    console.log(yellow('[警告] download_models.py 执行未成功，正在复查模型可用性...'));
+    console.log(red('[错误] download_models.py 执行失败，请检查网络连接！'));
+    process.exit(1);
   }
 }
 
 const sensevoiceModelAfter = existsSync(resolve(sensevoiceDir, 'model.int8.onnx')) || existsSync(resolve(sensevoiceDir, 'model.onnx'));
 const sensevoiceTokensAfter = existsSync(resolve(sensevoiceDir, 'tokens.txt'));
-if (!sensevoiceModelAfter || !sensevoiceTokensAfter) {
-  console.log(red('\n[错误] SenseVoice 模型文件缺失，服务无法启动！请检查 models 目录或网络连接。'));
-  process.exit(1);
-}
-
 const paraformerReadyAfter =
   existsSync(resolve(paraformerDir, 'encoder.int8.onnx')) &&
   existsSync(resolve(paraformerDir, 'decoder.int8.onnx')) &&
   existsSync(resolve(paraformerDir, 'tokens.txt'));
 
-if (!paraformerReadyAfter) {
-  console.log(yellow('[提示] Streaming Paraformer 模型缺失，系统将以 Final-Only (仅离线定稿) 优雅降级模式启动。'));
+if (!sensevoiceModelAfter || !sensevoiceTokensAfter || !paraformerReadyAfter) {
+  console.log(red('\n[错误] 基础语音模型（SenseVoice / Streaming Paraformer）不完整，服务无法启动！'));
+  process.exit(1);
 }
+console.log(green('[✓] 核心流式与定稿模型全部就绪！\n'));
 
 // 3. 查找支持 GPU (CUDA) 的最佳 Python 解释器
 const condaPy = 'D:\\resource\\miniconda3\\envs\\auto-sub\\python.exe';

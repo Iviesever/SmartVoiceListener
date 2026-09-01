@@ -64,7 +64,6 @@ export function App() {
     pauseCountdown,
     vadConfig,
     serverOnline,
-    streamingReady,
     activeModel,
     activeModelId,
     availableModels,
@@ -155,9 +154,7 @@ export function App() {
   if (isFinalizing) {
     statusDetail = `${activeModel} 正在完成最后定稿收尾...`;
   } else if (state === 'LISTENING_SILENCE') {
-    statusDetail = streamingReady
-      ? '正在监听环境音 (开口说话自动捕捉)'
-      : '正在监听环境音 (流式引擎未就绪，使用离线定稿)';
+    statusDetail = '正在监听环境音 (开口说话自动捕捉)';
   } else if (state === 'SPEAKING_ACTIVE') {
     statusDetail = '正在实时流式识别 (Partial)...';
   } else if (state === 'PAUSE_WAITING') {
