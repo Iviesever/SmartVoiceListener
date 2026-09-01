@@ -16,9 +16,7 @@ from server.asr_server import (
 )
 
 BASE_DIR = Path(__file__).resolve().parent
-MODELS_DIR = BASE_DIR / "models"
-SENSEVOICE_DIR = MODELS_DIR / "sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17"
-TEST_WAV = SENSEVOICE_DIR / "test_wavs" / "zh.wav"
+TEST_WAV = BASE_DIR / "test_data" / "zh.wav"
 
 
 def load_test_audio():
