@@ -27,7 +27,7 @@ export function useVoiceListener(options?: UseVoiceListenerOptions) {
   const inFlightAsrCountRef = useRef<number>(0);
 
   const engineRef = useRef<VadEngine | null>(null);
-  // 严格同步的 segmentsRef，完全不依赖 React render 时序
+  // 关键：segmentsRef 永远作为同步 Source-of-Truth，绝不依赖 React updater 排队时序
   const segmentsRef = useRef<TranscriptSegment[]>(segments);
 
   const optionsRef = useRef(options);
@@ -65,7 +65,7 @@ export function useVoiceListener(options?: UseVoiceListenerOptions) {
     return () => clearTimeout(timer);
   }, [segments]);
 
-  // 自闭环管理 pagehide 与 visibilitychange 立即落盘 Segments
+  // 自闭环管理 pagehide 与 visibilitychange 立即同步落盘 Segments
   useEffect(() => {
     const handleImmediateFlush = () => {
       saveSegments(segmentsRef.current);
@@ -158,19 +158,17 @@ export function useVoiceListener(options?: UseVoiceListenerOptions) {
           createdAt: Date.now(),
         };
 
-        // 同步更新 segmentsRef，不依赖 React render 时序
-        setSegments((prev) => {
-          const next = [...prev, segment];
-          segmentsRef.current = next;
-          return next;
-        });
+        // 关键修复：先同步修改 ref，再让 React state 跟随，保证 0 延迟 Source-of-Truth
+        const nextSegments = [...segmentsRef.current, segment];
+        segmentsRef.current = nextSegments;
+        setSegments(nextSegments);
 
         optionsRef.current?.onTranscriptFinal?.(res.text.trim(), segment);
       }
     } catch (err: unknown) {
       console.error('ASR transcription failed:', err);
     } finally {
-      // 关键 Blocker 修复：旧 epoch 请求绝不触碰新 session 的计数器与状态机！
+      // 关键 Blocker 守卫：旧 epoch 请求绝不触碰新 session 的计数器与状态机
       if (speechEpoch !== sessionEpochRef.current) {
         return;
       }
@@ -254,15 +252,18 @@ export function useVoiceListener(options?: UseVoiceListenerOptions) {
   const resetWorkspace = useCallback(() => {
     sessionEpochRef.current += 1;
     inFlightAsrCountRef.current = 0;
-    setSegments((prev) => {
-      prev.forEach((s) => {
-        if (s.audioBlobUrl?.startsWith('blob:')) {
-          URL.revokeObjectURL(s.audioBlobUrl);
-        }
-      });
-      segmentsRef.current = [];
-      return [];
+
+    // 关键修复：同步释放 Blob URL、同步清空 ref、立即持久化并更新 React state
+    const previousSegments = segmentsRef.current;
+    previousSegments.forEach((s) => {
+      if (s.audioBlobUrl?.startsWith('blob:')) {
+        URL.revokeObjectURL(s.audioBlobUrl);
+      }
     });
+
+    segmentsRef.current = [];
+    setSegments([]);
+    saveSegments([]);
   }, []);
 
   // 更新设置
