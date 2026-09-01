@@ -33,7 +33,10 @@ export const StatusHeader: React.FC<StatusHeaderProps> = ({
   let statusClass = 'status-idle';
   let statusLabel = '未启动';
 
-  if (state === 'LISTENING_SILENCE') {
+  if (!serverOnline && !isCapturing) {
+    statusClass = 'status-offline';
+    statusLabel = '服务未连';
+  } else if (state === 'LISTENING_SILENCE') {
     statusClass = 'status-listening';
     statusLabel = '监听中';
   } else if (state === 'SPEAKING_ACTIVE') {
@@ -47,7 +50,7 @@ export const StatusHeader: React.FC<StatusHeaderProps> = ({
     statusLabel = isFinalizing ? '定稿收尾' : '定稿校正';
   }
 
-  const isButtonDisabled = isStarting || isFinalizing;
+  const isButtonDisabled = isStarting || isFinalizing || (!isCapturing && !serverOnline);
   let buttonLabel = '开启监听';
   if (isStarting) {
     buttonLabel = '启动中...';

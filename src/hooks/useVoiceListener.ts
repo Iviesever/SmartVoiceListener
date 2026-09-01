@@ -307,7 +307,12 @@ export function useVoiceListener(options?: UseVoiceListenerOptions) {
       if (attempt === startAttemptRef.current) {
         setCaptureState('IDLE');
         console.error('Failed to start AudioCaptureEngine:', err);
-        alert('启动麦克风失败，请检查浏览器麦克风权限！');
+        const errMsg = err instanceof Error ? err.message : String(err);
+        if (errMsg.includes('WebSocket')) {
+          alert('无法连接到本地语音流式服务（8767 端口）！请确认后端服务已启动。');
+        } else {
+          alert('启动麦克风失败，请检查浏览器麦克风权限！');
+        }
       }
     } finally {
       if (attempt === startAttemptRef.current) {

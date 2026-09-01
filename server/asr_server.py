@@ -87,6 +87,11 @@ class StreamingEngine:
         self.recognizer: Optional[sherpa_onnx.OnlineRecognizer] = None
         self.is_ready = False
         self._load_engine()
+        if not self.is_ready or self.recognizer is None:
+            raise RuntimeError(
+                "Streaming Paraformer failed to initialize; "
+                "SmartVoiceListener cannot start without streaming ASR."
+            )
 
     def _load_engine(self):
         model_dir = MODELS_DIR / "sherpa-onnx-streaming-paraformer-bilingual-zh-en"
@@ -95,9 +100,9 @@ class StreamingEngine:
         tokens = model_dir / "tokens.txt"
 
         if not (encoder.exists() and decoder.exists() and tokens.exists()):
-            print(f"[!] Warning: Streaming Paraformer files not found in {model_dir}")
-            self.is_ready = False
-            return
+            raise FileNotFoundError(
+                f"Streaming Paraformer files are incomplete in {model_dir}"
+            )
 
         print(f"[*] Loading Streaming Paraformer INT8 engine from {model_dir} ...")
         t0 = time.perf_counter()
@@ -117,6 +122,7 @@ class StreamingEngine:
         except Exception as e:
             print(f"[!] Failed to load Streaming Paraformer: {e}", file=sys.stderr)
             self.is_ready = False
+            raise RuntimeError(f"OnlineRecognizer failed to load: {e}") from e
 
     def create_stream(self) -> Optional[sherpa_onnx.OnlineStream]:
         if not self.is_ready or self.recognizer is None:

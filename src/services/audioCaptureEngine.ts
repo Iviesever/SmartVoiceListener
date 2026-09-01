@@ -491,6 +491,9 @@ export class AudioCaptureEngine {
 
     // 1. 建立 WebSocket 连接
     await this.transport.connect();
+    if (!this.transport.ready) {
+      throw new Error('WebSocket connection to ASR stream failed');
+    }
 
     // 2. 申请麦克风音频流
     const stream = await navigator.mediaDevices.getUserMedia({
