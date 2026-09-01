@@ -1,26 +1,39 @@
-import { useState, useRef, useCallback } from 'react';
+import { useState, useRef, useCallback, useEffect } from 'react';
 import { useVoiceListener } from './hooks/useVoiceListener';
 import { StatusHeader } from './components/StatusHeader';
 import { DocumentEditor, DocumentEditorHandle } from './components/DocumentEditor/DocumentEditor';
 import { UnreadTranscriptAnchor } from './components/DocumentEditor/UnreadTranscriptAnchor';
 import { SettingsModal } from './components/SettingsModal';
 import { CopyIcon, CheckIcon, DownloadIcon, TrashIcon } from './components/Icons';
+import { loadSavedDocument, saveDocumentContent } from './services/storageService';
 
 export default function App() {
   const editorRef = useRef<DocumentEditorHandle | null>(null);
 
-  const [charCount, setCharCount] = useState<number>(0);
+  // 初始加载历史保存文档
+  const initialDocumentRef = useRef<string>(loadSavedDocument());
+
+  const [charCount, setCharCount] = useState<number>(() => {
+    return initialDocumentRef.current.replace(/\s/g, '').length;
+  });
   const [unreadCount, setUnreadCount] = useState<number>(0);
   const [isCopied, setIsCopied] = useState<boolean>(false);
   const [isSettingsOpen, setIsSettingsOpen] = useState<boolean>(false);
+
+  const saveTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   // ASR 定稿事件回调：安全调用 DocumentEditor 的 appendTranscript
   const handleTranscriptFinal = useCallback((text: string) => {
     editorRef.current?.appendTranscript(text);
   }, []);
 
-  const handleDocChange = useCallback((_text: string, count: number) => {
+  // 文档内容变化防抖持久化 (600ms debounce)
+  const handleDocChange = useCallback((text: string, count: number) => {
     setCharCount(count);
+    if (saveTimerRef.current) clearTimeout(saveTimerRef.current);
+    saveTimerRef.current = setTimeout(() => {
+      saveDocumentContent(text);
+    }, 600);
   }, []);
 
   const handleUnreadCountChange = useCallback((count: number) => {
@@ -44,6 +57,15 @@ export default function App() {
   } = useVoiceListener({
     onTranscriptFinal: handleTranscriptFinal,
   });
+
+  // 组件卸载时若有待落盘的保存定时器，立即落盘
+  useEffect(() => {
+    return () => {
+      if (saveTimerRef.current) {
+        clearTimeout(saveTimerRef.current);
+      }
+    };
+  }, []);
 
   // 复制全文到剪贴板
   const handleCopyFullText = async () => {
@@ -76,6 +98,8 @@ export default function App() {
   // 清空文档与后台 Generation
   const handleClearAll = () => {
     if (window.confirm('确定要清空文档内容吗？')) {
+      if (saveTimerRef.current) clearTimeout(saveTimerRef.current);
+      saveDocumentContent('');
       editorRef.current?.clearContent();
       resetWorkspace();
       setCharCount(0);
@@ -112,6 +136,7 @@ export default function App() {
       <div className="editor-main-wrapper">
         <DocumentEditor
           ref={editorRef}
+          initialContent={initialDocumentRef.current}
           onDocChange={handleDocChange}
           onUnreadCountChange={handleUnreadCountChange}
         />

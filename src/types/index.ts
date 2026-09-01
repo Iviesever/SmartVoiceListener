@@ -5,37 +5,37 @@ export type ListenerState =
   | 'PAUSE_WAITING'        // 说话短暂停顿（等待判定是否说完）
   | 'TRANSCRIBING';        // 正在语音转写中
 
-// 底层 Segment 数据层（投影到文档，但保留原始 ASR 证据）
+// 底层不可变 Segment 数据层（投影到文档，但保留原始不可变 ASR 证据）
 export interface TranscriptSegment {
-  id: string;
-  generation: number;       // 文档世代代数（清空或新建后递增，防竞态复活）
-  startedAt: number;
-  endedAt: number;
-  originalText: string;     // 原始 ASR 转录文字（不可变证据）
-  modelId: string;
-  durationMs: number;
-  audioBlobUrl?: string;
-  createdAt: number;
+  readonly id: string;
+  readonly generation: number;       // 会话/文档世代代数（清空或新建后递增，防竞态复活）
+  readonly startedAt: number;
+  readonly endedAt: number;
+  readonly originalText: string;     // 原始 ASR 转录文字（不可变证据）
+  readonly modelId: string;
+  readonly durationMs: number;
+  readonly audioBlobUrl?: string;
+  readonly createdAt: number;
 }
 
 // 预留的流式转录事件协议
 export type TranscriptEvent =
   | {
-      type: 'partial';
-      segmentId: string;
-      generation: number;
-      text: string;
+      readonly type: 'partial';
+      readonly segmentId: string;
+      readonly generation: number;
+      readonly text: string;
     }
   | {
-      type: 'final';
-      segmentId: string;
-      generation: number;
-      text: string;
-      startedAt: number;
-      endedAt: number;
-      modelId: string;
-      durationMs: number;
-      audioBlobUrl?: string;
+      readonly type: 'final';
+      readonly segmentId: string;
+      readonly generation: number;
+      readonly text: string;
+      readonly startedAt: number;
+      readonly endedAt: number;
+      readonly modelId: string;
+      readonly durationMs: number;
+      readonly audioBlobUrl?: string;
     };
 
 export interface VadConfig {

@@ -1,5 +1,5 @@
 import { useEffect, useRef, useImperativeHandle, forwardRef, useCallback } from 'react';
-import { EditorState } from '@codemirror/state';
+import { EditorState, Transaction } from '@codemirror/state';
 import { EditorView, keymap, placeholder } from '@codemirror/view';
 import { defaultKeymap, history, historyKeymap } from '@codemirror/commands';
 
@@ -11,6 +11,7 @@ export interface DocumentEditorHandle {
 }
 
 interface DocumentEditorProps {
+  initialContent?: string;
   onDocChange?: (content: string, charCount: number) => void;
   onUnreadCountChange?: (count: number) => void;
 }
@@ -72,7 +73,7 @@ const typoraTheme = EditorView.theme({
 });
 
 export const DocumentEditor = forwardRef<DocumentEditorHandle, DocumentEditorProps>(
-  ({ onDocChange, onUnreadCountChange }, ref) => {
+  ({ initialContent = '', onDocChange, onUnreadCountChange }, ref) => {
     const editorContainerRef = useRef<HTMLDivElement | null>(null);
     const editorViewRef = useRef<EditorView | null>(null);
 
@@ -82,11 +83,15 @@ export const DocumentEditor = forwardRef<DocumentEditorHandle, DocumentEditorPro
     const onUnreadCountChangeRef = useRef(onUnreadCountChange);
     onUnreadCountChangeRef.current = onUnreadCountChange;
 
+    // 控制器内部状态
     const isComposingRef = useRef<boolean>(false);
     const pendingTranscriptsRef = useRef<string[]>([]);
     const isAtBottomRef = useRef<boolean>(true);
     const unreadCountRef = useRef<number>(0);
+    const lastUserEditAtRef = useRef<number>(0);
+    const tailEditTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
+    // 智能滚动到文档底部
     const scrollToBottom = useCallback(() => {
       const view = editorViewRef.current;
       if (!view) return;
@@ -102,6 +107,7 @@ export const DocumentEditor = forwardRef<DocumentEditorHandle, DocumentEditorPro
       onUnreadCountChangeRef.current?.(0);
     }, []);
 
+    // 消费 pendingTranscripts 队列
     const flushPendingTranscripts = useCallback(() => {
       if (pendingTranscriptsRef.current.length === 0) return;
       const view = editorViewRef.current;
@@ -114,8 +120,10 @@ export const DocumentEditor = forwardRef<DocumentEditorHandle, DocumentEditorPro
         const docLength = view.state.doc.length;
         const insertText = (docLength > 0 ? '\n\n' : '') + text;
 
+        // 关键：ASR 自动追加不进入用户的 Undo 历史栈 (addToHistory: false)
         view.dispatch({
           changes: { from: docLength, insert: insertText },
+          annotations: Transaction.addToHistory.of(false),
           userEvent: 'input.asr',
         });
 
@@ -128,24 +136,48 @@ export const DocumentEditor = forwardRef<DocumentEditorHandle, DocumentEditorPro
       }
     }, [scrollToBottom]);
 
+    // 判断用户是否正在文档尾部活跃打字（非 IME 状态下的普通连续敲击）
+    const isUserActivelyEditingTail = useCallback((view: EditorView): boolean => {
+      if (!view.hasFocus) return false;
+      const docLength = view.state.doc.length;
+      const selectionHead = view.state.selection.main.head;
+      const isNearTail = selectionHead >= docLength - 2;
+      const isRecentEdit = Date.now() - lastUserEditAtRef.current < 800; // 800ms 防打扰窗口
+      return isNearTail && isRecentEdit;
+    }, []);
+
+    // 程序化追加一条定稿转录文本
     const appendTranscript = useCallback(
       (text: string) => {
         const trimmed = text.trim();
         if (!trimmed) return;
 
+        const view = editorViewRef.current;
+        if (!view) return;
+
+        // 1. 若处于 IME 中文拼音输入中 -> 安全排队
         if (isComposingRef.current) {
           pendingTranscriptsRef.current.push(trimmed);
           return;
         }
 
-        const view = editorViewRef.current;
-        if (!view) return;
+        // 2. 若用户正处于文档尾部连续打字编辑中 -> 安全排队并延迟 flush
+        if (isUserActivelyEditingTail(view)) {
+          pendingTranscriptsRef.current.push(trimmed);
+          if (tailEditTimerRef.current) clearTimeout(tailEditTimerRef.current);
+          tailEditTimerRef.current = setTimeout(() => {
+            flushPendingTranscripts();
+          }, 800);
+          return;
+        }
 
+        // 3. 正常状态：派发 Transaction，并在末尾追加（不抢占 Undo 栈）
         const docLength = view.state.doc.length;
         const insertText = (docLength > 0 ? '\n\n' : '') + trimmed;
 
         view.dispatch({
           changes: { from: docLength, insert: insertText },
+          annotations: Transaction.addToHistory.of(false),
           userEvent: 'input.asr',
         });
 
@@ -156,13 +188,18 @@ export const DocumentEditor = forwardRef<DocumentEditorHandle, DocumentEditorPro
           onUnreadCountChangeRef.current?.(unreadCountRef.current);
         }
       },
-      [scrollToBottom]
+      [scrollToBottom, isUserActivelyEditingTail, flushPendingTranscripts]
     );
 
+    // 清空编辑器全文
     const clearContent = useCallback(() => {
       const view = editorViewRef.current;
       if (!view) return;
 
+      if (tailEditTimerRef.current) {
+        clearTimeout(tailEditTimerRef.current);
+        tailEditTimerRef.current = null;
+      }
       pendingTranscriptsRef.current = [];
       unreadCountRef.current = 0;
       onUnreadCountChangeRef.current?.(0);
@@ -174,6 +211,7 @@ export const DocumentEditor = forwardRef<DocumentEditorHandle, DocumentEditorPro
       isAtBottomRef.current = true;
     }, []);
 
+    // 获取全文内容
     const getContent = useCallback(() => {
       return editorViewRef.current?.state.doc.toString() || '';
     }, []);
@@ -189,11 +227,12 @@ export const DocumentEditor = forwardRef<DocumentEditorHandle, DocumentEditorPro
       [appendTranscript, clearContent, getContent, scrollToBottom]
     );
 
+    // 初始化 CodeMirror 6 (仅在 mount 时执行一次)
     useEffect(() => {
       if (!editorContainerRef.current) return;
 
       const startState = EditorState.create({
-        doc: '',
+        doc: initialContent,
         extensions: [
           history(),
           keymap.of([...defaultKeymap, ...historyKeymap]),
@@ -201,9 +240,19 @@ export const DocumentEditor = forwardRef<DocumentEditorHandle, DocumentEditorPro
           placeholder('等待语音输入，或在此直接打字编辑...'),
           typoraTheme,
           EditorView.updateListener.of((update) => {
+            // 追踪用户真实输入行为时间戳
+            const hasUserInput = update.transactions.some(
+              (tr) => tr.isUserEvent('input') || tr.isUserEvent('delete')
+            );
+            if (hasUserInput) {
+              lastUserEditAtRef.current = Date.now();
+            }
+
             if (update.docChanged) {
               const str = update.state.doc.toString();
-              onDocChangeRef.current?.(str, str.length);
+              // 严格纯文字统计（过滤纯空白符）
+              const strictCount = str.replace(/\s/g, '').length;
+              onDocChangeRef.current?.(str, strictCount);
             }
           }),
         ],
@@ -216,6 +265,13 @@ export const DocumentEditor = forwardRef<DocumentEditorHandle, DocumentEditorPro
 
       editorViewRef.current = view;
 
+      // 触发初始字数通知
+      if (initialContent) {
+        const strictCount = initialContent.replace(/\s/g, '').length;
+        onDocChangeRef.current?.(initialContent, strictCount);
+      }
+
+      // 容差滚动监听 (80px)
       const scroller = view.scrollDOM;
       const handleScroll = () => {
         const distanceFromBottom = scroller.scrollHeight - scroller.scrollTop - scroller.clientHeight;
@@ -230,6 +286,7 @@ export const DocumentEditor = forwardRef<DocumentEditorHandle, DocumentEditorPro
 
       scroller.addEventListener('scroll', handleScroll, { passive: true });
 
+      // IME 中文拼音输入法保护
       const handleCompositionStart = () => {
         isComposingRef.current = true;
       };
@@ -245,13 +302,17 @@ export const DocumentEditor = forwardRef<DocumentEditorHandle, DocumentEditorPro
       view.contentDOM.addEventListener('compositionend', handleCompositionEnd);
 
       return () => {
+        if (tailEditTimerRef.current) {
+          clearTimeout(tailEditTimerRef.current);
+          tailEditTimerRef.current = null;
+        }
         scroller.removeEventListener('scroll', handleScroll);
         view.contentDOM.removeEventListener('compositionstart', handleCompositionStart);
         view.contentDOM.removeEventListener('compositionend', handleCompositionEnd);
         view.destroy();
         editorViewRef.current = null;
       };
-    }, [flushPendingTranscripts]);
+    }, [initialContent, flushPendingTranscripts]);
 
     return (
       <div className="document-workspace">

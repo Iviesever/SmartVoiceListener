@@ -2,6 +2,7 @@ import { useState, useRef, useEffect, useCallback } from 'react';
 import { ListenerState, TranscriptSegment, VadConfig, ModelInfo } from '../types';
 import { VadEngine, DEFAULT_VAD_CONFIG, pcmToWavBlob } from '../services/vadEngine';
 import { transcribeAudioBlob, checkAsrHealth, fetchAvailableModels, switchActiveModel } from '../services/asrService';
+import { loadSavedSegments, saveSegments } from '../services/storageService';
 
 interface UseVoiceListenerOptions {
   onTranscriptFinal?: (text: string, segment: TranscriptSegment) => void;
@@ -17,11 +18,15 @@ export function useVoiceListener(options?: UseVoiceListenerOptions) {
   const [activeModelId, setActiveModelId] = useState<string>('sensevoice-onnx');
   const [availableModels, setAvailableModels] = useState<ModelInfo[]>([]);
   const [isSwitchingModel, setIsSwitchingModel] = useState<boolean>(false);
-  const [segments, setSegments] = useState<TranscriptSegment[]>([]);
+  const [segments, setSegments] = useState<TranscriptSegment[]>(() => loadSavedSegments());
 
-  // 关键：Document Generation Token (防清空或切换后的旧请求迟到竞态复活)
-  const documentGenerationRef = useRef<number>(1);
+  // 关键：全局会话世代 (Session Epoch)，在清空、停止、新开启时递增，彻底封死并发竞态
+  const sessionEpochRef = useRef<number>(1);
+  const currentSpeechEpochRef = useRef<number>(1);
   const engineRef = useRef<VadEngine | null>(null);
+  const segmentsRef = useRef<TranscriptSegment[]>(segments);
+  segmentsRef.current = segments;
+
   const optionsRef = useRef(options);
   optionsRef.current = options;
 
@@ -49,6 +54,27 @@ export function useVoiceListener(options?: UseVoiceListenerOptions) {
     return () => clearInterval(timer);
   }, [refreshServerStatus]);
 
+  // Segments 变更防抖持久化 (500ms)
+  useEffect(() => {
+    const timer = setTimeout(() => {
+      saveSegments(segments);
+    }, 500);
+    return () => clearTimeout(timer);
+  }, [segments]);
+
+  // 页面卸载时释放所有未释放的 Blob URL 以及麦克风
+  useEffect(() => {
+    return () => {
+      engineRef.current?.stop();
+      engineRef.current = null;
+      segmentsRef.current.forEach((s) => {
+        if (s.audioBlobUrl?.startsWith('blob:')) {
+          URL.revokeObjectURL(s.audioBlobUrl);
+        }
+      });
+    };
+  }, []);
+
   // 切换 ASR 识别模型
   const handleSwitchModel = useCallback(async (modelId: string) => {
     setIsSwitchingModel(true);
@@ -67,12 +93,16 @@ export function useVoiceListener(options?: UseVoiceListenerOptions) {
   }, [refreshServerStatus]);
 
   // 处理一段说话结束后的 ASR 转写
-  const handleSpeakingEnd = useCallback(async (pcmData: Float32Array, durationMs: number) => {
+  const handleSpeakingEnd = useCallback(async (pcmData: Float32Array, durationMs: number, speechEpoch: number) => {
+    // 若在说话期间已经发生 session reset/stop，直接放弃发起请求
+    if (speechEpoch !== sessionEpochRef.current) {
+      console.log('[ASR] Discarding speech chunk due to session epoch change during recording');
+      return;
+    }
+
     setState('TRANSCRIBING');
     setPauseCountdown(0);
 
-    // 绑定当前发起任务时的 Generation Token
-    const jobGeneration = documentGenerationRef.current;
     const now = Date.now();
     const startedAt = now - durationMs;
     const endedAt = now;
@@ -82,9 +112,9 @@ export function useVoiceListener(options?: UseVoiceListenerOptions) {
     try {
       const res = await transcribeAudioBlob(wavBlob);
       
-      // 竞态校验：若用户在识别过程中点击了清空，或文档代数已更新，彻底丢弃此迟到结果
-      if (jobGeneration !== documentGenerationRef.current) {
-        console.log('[ASR] Discarding stale transcript due to generation mismatch:', res.text);
+      // 竞态校验：比对 speechEpoch 是否等于当前的 sessionEpochRef
+      if (speechEpoch !== sessionEpochRef.current) {
+        console.log('[ASR] Discarding stale transcript due to epoch mismatch:', res.text);
         URL.revokeObjectURL(audioUrl);
         return;
       }
@@ -92,7 +122,7 @@ export function useVoiceListener(options?: UseVoiceListenerOptions) {
       if (res.text) {
         const segment: TranscriptSegment = {
           id: `seg-${Date.now()}-${Math.random().toString(36).substring(2, 7)}`,
-          generation: jobGeneration,
+          generation: speechEpoch,
           startedAt,
           endedAt,
           originalText: res.text, // 原始 ASR 证据不可变
@@ -109,8 +139,9 @@ export function useVoiceListener(options?: UseVoiceListenerOptions) {
       console.error('ASR transcription failed:', err);
       URL.revokeObjectURL(audioUrl);
     } finally {
-      if (engineRef.current) {
-        setState('LISTENING_SILENCE');
+      // 关键保护：只有当前仍是同一 session 且引擎仍在运行时才切换为 LISTENING_SILENCE
+      if (speechEpoch === sessionEpochRef.current && engineRef.current) {
+        setState((current) => (current === 'TRANSCRIBING' ? 'LISTENING_SILENCE' : current));
       }
     }
   }, [vadConfig.sampleRate, activeModelId]);
@@ -122,8 +153,14 @@ export function useVoiceListener(options?: UseVoiceListenerOptions) {
         engineRef.current.stop();
       }
 
+      // 开启新会话时更新 session epoch
+      sessionEpochRef.current += 1;
+      const currentSession = sessionEpochRef.current;
+
       const engine = new VadEngine(vadConfig);
       engine.onSpeakingStart = () => {
+        // 在开口说话的一瞬间锁定当前 speech epoch
+        currentSpeechEpochRef.current = sessionEpochRef.current;
         setState('SPEAKING_ACTIVE');
         setPauseCountdown(0);
       };
@@ -132,13 +169,19 @@ export function useVoiceListener(options?: UseVoiceListenerOptions) {
         setPauseCountdown(remainingMs);
       };
       engine.onSpeakingEnd = (pcm, dur) => {
-        void handleSpeakingEnd(pcm, dur);
+        const speechEpoch = currentSpeechEpochRef.current;
+        void handleSpeakingEnd(pcm, dur, speechEpoch);
       };
       engine.onVolumeUpdate = (vol) => {
         setVolume(vol);
       };
 
       await engine.start();
+      if (currentSession !== sessionEpochRef.current) {
+        engine.stop();
+        return;
+      }
+
       engineRef.current = engine;
       setState('LISTENING_SILENCE');
     } catch (err) {
@@ -150,6 +193,7 @@ export function useVoiceListener(options?: UseVoiceListenerOptions) {
 
   // 停止监听
   const stopListening = useCallback(() => {
+    sessionEpochRef.current += 1; // 终止当前所有 in-flight 任务的合法性
     if (engineRef.current) {
       engineRef.current.stop();
       engineRef.current = null;
@@ -168,12 +212,14 @@ export function useVoiceListener(options?: UseVoiceListenerOptions) {
     }
   }, [state, startListening, stopListening]);
 
-  // 清空文档与底层 Segments（同时递增 Generation Token 杜绝竞态）
+  // 清空文档与后台 Segments
   const resetWorkspace = useCallback(() => {
-    documentGenerationRef.current += 1;
+    sessionEpochRef.current += 1; // 递增世代，彻底废弃已在队列或飞行中的所有请求
     setSegments((prev) => {
       prev.forEach((s) => {
-        if (s.audioBlobUrl) URL.revokeObjectURL(s.audioBlobUrl);
+        if (s.audioBlobUrl?.startsWith('blob:')) {
+          URL.revokeObjectURL(s.audioBlobUrl);
+        }
       });
       return [];
     });
