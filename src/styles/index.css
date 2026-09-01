@@ -367,12 +367,14 @@ html, body {
   font-size: 0.8rem;
   color: var(--text-muted);
   flex-shrink: 0;
+  gap: 12px;
 }
 
 .status-indicator-group {
   display: flex;
   align-items: center;
   gap: 8px;
+  min-width: 0;
 }
 
 .voice-pulse-dot {
@@ -381,6 +383,7 @@ html, body {
   border-radius: 50%;
   background: var(--text-subtle);
   transition: transform 0.1s ease, background 0.2s ease;
+  flex-shrink: 0;
 }
 
 .voice-pulse-dot[data-state="LISTENING_SILENCE"] { background: var(--success); }
@@ -390,12 +393,16 @@ html, body {
 
 .status-text {
   font-weight: 500;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 .footer-actions-group {
   display: flex;
   align-items: center;
   gap: 8px;
+  flex-shrink: 0;
 }
 
 .char-counter {
@@ -532,4 +539,50 @@ html, body {
   font-size: 0.9rem;
   font-weight: 600;
   cursor: pointer;
+}
+
+/* ========================================== */
+/* 移动端与窄屏自适应响应式布局 (Mobile / Narrow) */
+/* ========================================== */
+@media (max-width: 640px) {
+  .app-container {
+    padding: 8px;
+    gap: 8px;
+  }
+
+  .top-header {
+    flex-direction: column;
+    align-items: stretch;
+    padding: 8px 12px;
+    gap: 8px;
+  }
+
+  .brand-title {
+    justify-content: space-between;
+    width: 100%;
+  }
+
+  .header-controls {
+    justify-content: space-between;
+    width: 100%;
+  }
+
+  .model-select {
+    max-width: 140px;
+  }
+
+  .cm-scroller {
+    padding: 16px 16px !important;
+  }
+
+  .bottom-status-bar {
+    flex-direction: column;
+    align-items: stretch;
+    padding: 8px 12px;
+    gap: 6px;
+  }
+
+  .footer-actions-group {
+    justify-content: space-between;
+  }
 }
