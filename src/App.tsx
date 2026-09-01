@@ -5,13 +5,14 @@ import { DocumentEditor, DocumentEditorHandle } from './components/DocumentEdito
 import { UnreadTranscriptAnchor } from './components/DocumentEditor/UnreadTranscriptAnchor';
 import { SettingsModal } from './components/SettingsModal';
 import { CopyIcon, CheckIcon, DownloadIcon, TrashIcon } from './components/Icons';
-import { loadSavedDocument, saveDocumentContent } from './services/storageService';
+import { loadSavedDocument, saveDocumentContent, saveSegments } from './services/storageService';
 
 export default function App() {
   const editorRef = useRef<DocumentEditorHandle | null>(null);
 
   // 初始加载历史保存文档
   const initialDocumentRef = useRef<string>(loadSavedDocument());
+  const latestDocRef = useRef<string>(initialDocumentRef.current);
 
   const [charCount, setCharCount] = useState<number>(() => {
     return initialDocumentRef.current.replace(/\s/g, '').length;
@@ -29,6 +30,7 @@ export default function App() {
 
   // 文档内容变化防抖持久化 (600ms debounce)
   const handleDocChange = useCallback((text: string, count: number) => {
+    latestDocRef.current = text;
     setCharCount(count);
     if (saveTimerRef.current) clearTimeout(saveTimerRef.current);
     saveTimerRef.current = setTimeout(() => {
@@ -42,6 +44,7 @@ export default function App() {
 
   const {
     state,
+    segments,
     volume,
     pauseCountdown,
     vadConfig,
@@ -58,12 +61,32 @@ export default function App() {
     onTranscriptFinal: handleTranscriptFinal,
   });
 
-  // 组件卸载时若有待落盘的保存定时器，立即落盘
+  const latestSegmentsRef = useRef(segments);
+  latestSegmentsRef.current = segments;
+
+  // 关键：监听 pagehide 与 visibilitychange，确保在刷新/关闭/切后台时立刻落盘，消除 debounce 丢数据窗口
   useEffect(() => {
-    return () => {
+    const handleImmediateFlush = () => {
       if (saveTimerRef.current) {
         clearTimeout(saveTimerRef.current);
       }
+      saveDocumentContent(latestDocRef.current);
+      saveSegments(latestSegmentsRef.current);
+    };
+
+    const handleVisibilityChange = () => {
+      if (document.visibilityState === 'hidden') {
+        handleImmediateFlush();
+      }
+    };
+
+    window.addEventListener('pagehide', handleImmediateFlush);
+    document.addEventListener('visibilitychange', handleVisibilityChange);
+
+    return () => {
+      window.removeEventListener('pagehide', handleImmediateFlush);
+      document.removeEventListener('visibilitychange', handleVisibilityChange);
+      handleImmediateFlush();
     };
   }, []);
 
@@ -99,6 +122,7 @@ export default function App() {
   const handleClearAll = () => {
     if (window.confirm('确定要清空文档内容吗？')) {
       if (saveTimerRef.current) clearTimeout(saveTimerRef.current);
+      latestDocRef.current = '';
       saveDocumentContent('');
       editorRef.current?.clearContent();
       resetWorkspace();
