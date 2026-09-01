@@ -13,6 +13,7 @@ export default function App() {
   // 初始加载历史保存文档
   const initialDocumentRef = useRef<string>(loadSavedDocument());
   const latestDocRef = useRef<string>(initialDocumentRef.current);
+  const lastStreamingPartialTextRef = useRef<string>('');
 
   const [charCount, setCharCount] = useState<number>(() => {
     return initialDocumentRef.current.replace(/\s/g, '').length;
@@ -23,8 +24,31 @@ export default function App() {
 
   const saveTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
-  // ASR 定稿事件回调：安全调用 DocumentEditor 的 appendTranscript
+  // 1. 流式 Partial 增量回调（更新视觉投影，零文档污染）
+  const handleTranscriptPartial = useCallback((text: string, segmentId: string) => {
+    lastStreamingPartialTextRef.current = text;
+    editorRef.current?.setStreamingPartial({
+      text,
+      segmentId,
+      isEnded: false,
+    });
+  }, []);
+
+  // 2. 说话结束回调（保持最后一版灰字显示，呼吸光标静止，防止 Final 到来前视觉闪断）
+  const handleTranscriptSpeechEnd = useCallback((segmentId: string) => {
+    if (lastStreamingPartialTextRef.current) {
+      editorRef.current?.setStreamingPartial({
+        text: lastStreamingPartialTextRef.current,
+        segmentId,
+        isEnded: true,
+      });
+    }
+  }, []);
+
+  // 3. 二阶段 Final 定稿回调：移除 Partial 投影并正式将定稿文本追加写入文档
   const handleTranscriptFinal = useCallback((text: string) => {
+    lastStreamingPartialTextRef.current = '';
+    editorRef.current?.clearStreamingPartial();
     editorRef.current?.appendTranscript(text);
   }, []);
 
@@ -57,6 +81,8 @@ export default function App() {
     resetWorkspace,
     updateVadConfig,
   } = useVoiceListener({
+    onTranscriptPartial: handleTranscriptPartial,
+    onTranscriptSpeechEnd: handleTranscriptSpeechEnd,
     onTranscriptFinal: handleTranscriptFinal,
   });
 
@@ -118,7 +144,9 @@ export default function App() {
     if (window.confirm('确定要清空文档内容吗？')) {
       if (saveTimerRef.current) clearTimeout(saveTimerRef.current);
       latestDocRef.current = '';
+      lastStreamingPartialTextRef.current = '';
       saveDocumentContent('');
+      editorRef.current?.clearStreamingPartial();
       editorRef.current?.clearContent();
       resetWorkspace();
       setCharCount(0);
@@ -129,12 +157,12 @@ export default function App() {
   // 状态栏动态指示文案
   let statusDetail = '就绪';
   if (state === 'LISTENING_SILENCE') statusDetail = '正在监听环境音 (开口说话自动捕捉)';
-  if (state === 'SPEAKING_ACTIVE') statusDetail = '正在收听说话中...';
+  if (state === 'SPEAKING_ACTIVE') statusDetail = '正在实时流式识别 (Partial)...';
   if (state === 'PAUSE_WAITING') {
     const sec = (pauseCountdown / 1000).toFixed(1);
-    statusDetail = `停顿检测 (${sec}s 后自动追加定稿)`;
+    statusDetail = `停顿检测 (${sec}s 后自动二阶段定稿)`;
   }
-  if (state === 'TRANSCRIBING') statusDetail = 'ASR 大模型正在极速转写...';
+  if (state === 'TRANSCRIBING') statusDetail = `${activeModel} 大模型正在二阶段高精校正...`;
 
   return (
     <div className="app-container">
@@ -151,7 +179,7 @@ export default function App() {
         onOpenSettings={() => setIsSettingsOpen(true)}
       />
 
-      {/* 核心文档编辑主工作区 (CodeMirror 6 纯白备忘录纸张) */}
+      {/* 核心文档编辑主工作区 (CodeMirror 6 纯白备忘录纸张 + Inline Ephemeral Partial) */}
       <div className="editor-main-wrapper">
         <DocumentEditor
           ref={editorRef}

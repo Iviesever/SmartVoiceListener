@@ -1,10 +1,18 @@
 import { useEffect, useRef, useImperativeHandle, forwardRef, useCallback } from 'react';
-import { EditorState, Transaction } from '@codemirror/state';
-import { EditorView, keymap, placeholder } from '@codemirror/view';
+import { EditorState, Transaction, StateField, StateEffect } from '@codemirror/state';
+import { EditorView, keymap, placeholder, Decoration, DecorationSet, WidgetType } from '@codemirror/view';
 import { defaultKeymap, history, historyKeymap } from '@codemirror/commands';
+
+export interface StreamingPartialPayload {
+  text: string;
+  segmentId?: string;
+  isEnded?: boolean;
+}
 
 export interface DocumentEditorHandle {
   appendTranscript: (text: string) => void;
+  setStreamingPartial: (payload: StreamingPartialPayload) => void;
+  clearStreamingPartial: () => void;
   clearContent: () => void;
   getContent: () => string;
   scrollToBottom: () => void;
@@ -16,7 +24,95 @@ interface DocumentEditorProps {
   onUnreadCountChange?: (count: number) => void;
 }
 
-// 强制显式设置 CodeMirror 6 的纯白高对比度主题
+// -----------------------------------------------------------------------------
+// CodeMirror 6 Block Widget for Inline Ephemeral Partial
+// -----------------------------------------------------------------------------
+
+export const setStreamingPartialEffect = StateEffect.define<StreamingPartialPayload>();
+export const clearStreamingPartialEffect = StateEffect.define<void>();
+
+class StreamingPartialBlockWidget extends WidgetType {
+  constructor(
+    readonly text: string,
+    readonly segmentId?: string,
+    readonly isEnded?: boolean
+  ) {
+    super();
+  }
+
+  toDOM(): HTMLElement {
+    const wrap = document.createElement('div');
+    wrap.className = 'cm-streaming-block';
+
+    const textSpan = document.createElement('span');
+    textSpan.className = 'cm-streaming-text';
+    textSpan.textContent = this.text;
+    wrap.appendChild(textSpan);
+
+    const caret = document.createElement('span');
+    caret.className = `cm-streaming-caret ${this.isEnded ? 'frozen' : ''}`;
+    caret.textContent = '▌';
+    wrap.appendChild(caret);
+
+    return wrap;
+  }
+
+  updateDOM(dom: HTMLElement): boolean {
+    const textSpan = dom.querySelector('.cm-streaming-text');
+    const caret = dom.querySelector('.cm-streaming-caret');
+    if (textSpan) {
+      textSpan.textContent = this.text;
+    }
+    if (caret) {
+      caret.className = `cm-streaming-caret ${this.isEnded ? 'frozen' : ''}`;
+    }
+    return true;
+  }
+
+  eq(other: StreamingPartialBlockWidget): boolean {
+    return (
+      other.text === this.text &&
+      other.segmentId === this.segmentId &&
+      other.isEnded === this.isEnded
+    );
+  }
+}
+
+export const streamingPartialField = StateField.define<DecorationSet>({
+  create() {
+    return Decoration.none;
+  },
+  update(decorations, tr) {
+    decorations = decorations.map(tr.changes);
+
+    for (const effect of tr.effects) {
+      if (effect.is(setStreamingPartialEffect)) {
+        const { text, segmentId, isEnded } = effect.value;
+        const trimmed = text.trim();
+        if (!trimmed) {
+          decorations = Decoration.none;
+        } else {
+          const docLen = tr.state.doc.length;
+          const widget = Decoration.widget({
+            widget: new StreamingPartialBlockWidget(trimmed, segmentId, isEnded),
+            side: 1,
+            block: true,
+          });
+          decorations = Decoration.set([widget.range(docLen)]);
+        }
+      } else if (effect.is(clearStreamingPartialEffect)) {
+        decorations = Decoration.none;
+      }
+    }
+    return decorations;
+  },
+  provide: (f) => EditorView.decorations.from(f),
+});
+
+// -----------------------------------------------------------------------------
+// 高对比度纯白主题配置
+// -----------------------------------------------------------------------------
+
 const typoraTheme = EditorView.theme({
   '&': {
     height: '100%',
@@ -72,6 +168,10 @@ const typoraTheme = EditorView.theme({
   },
 });
 
+// -----------------------------------------------------------------------------
+// DocumentEditor 组件
+// -----------------------------------------------------------------------------
+
 export const DocumentEditor = forwardRef<DocumentEditorHandle, DocumentEditorProps>(
   ({ initialContent = '', onDocChange, onUnreadCountChange }, ref) => {
     const editorContainerRef = useRef<HTMLDivElement | null>(null);
@@ -90,8 +190,9 @@ export const DocumentEditor = forwardRef<DocumentEditorHandle, DocumentEditorPro
     const unreadCountRef = useRef<number>(0);
     const lastUserEditAtRef = useRef<number>(0);
     const tailEditTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+    const hasStreamingPartialRef = useRef<boolean>(false);
 
-    // 智能滚动到文档底部
+    // 人工跳转滚动到文档底部 (带平滑动画)
     const scrollToBottom = useCallback(() => {
       const view = editorViewRef.current;
       if (!view) return;
@@ -105,6 +206,17 @@ export const DocumentEditor = forwardRef<DocumentEditorHandle, DocumentEditorPro
       isAtBottomRef.current = true;
       unreadCountRef.current = 0;
       onUnreadCountChangeRef.current?.(0);
+    }, []);
+
+    // 流式增量更新时的即时置底 (使用 requestAnimationFrame 合并，绝不使用 smooth 产生黏滞)
+    const instantScrollToBottom = useCallback(() => {
+      const view = editorViewRef.current;
+      if (!view) return;
+
+      requestAnimationFrame(() => {
+        const scroller = view.scrollDOM;
+        scroller.scrollTop = scroller.scrollHeight;
+      });
     }, []);
 
     // 实际执行队列消费与追加写入
@@ -128,15 +240,15 @@ export const DocumentEditor = forwardRef<DocumentEditorHandle, DocumentEditorPro
         });
 
         if (isAtBottomRef.current) {
-          scrollToBottom();
+          instantScrollToBottom();
         } else {
           unreadCountRef.current += 1;
           onUnreadCountChangeRef.current?.(unreadCountRef.current);
         }
       }
-    }, [scrollToBottom]);
+    }, [instantScrollToBottom]);
 
-    // 优化：首次调度即按剩余时间 (800 - elapsed) 计算，真正做到“自最后一次敲键起满 800ms 就追加”
+    // 尾部打字闲置调度
     const schedulePendingFlushAfterIdle = useCallback(() => {
       if (tailEditTimerRef.current) {
         clearTimeout(tailEditTimerRef.current);
@@ -146,20 +258,17 @@ export const DocumentEditor = forwardRef<DocumentEditorHandle, DocumentEditorPro
       if (pendingTranscriptsRef.current.length === 0) return;
 
       const tryFlush = () => {
-        // 1. 若仍处于输入法 composition 状态，继续等待
         if (isComposingRef.current) {
           tailEditTimerRef.current = setTimeout(tryFlush, 200);
           return;
         }
 
-        // 2. 严格校验距离最后一次用户真实打字是否满 800ms
         const elapsed = Date.now() - lastUserEditAtRef.current;
         if (elapsed < 800) {
           tailEditTimerRef.current = setTimeout(tryFlush, 800 - elapsed);
           return;
         }
 
-        // 3. 用户确实已闲置 800ms，安全出队写入
         flushPendingTranscripts();
       };
 
@@ -178,7 +287,36 @@ export const DocumentEditor = forwardRef<DocumentEditorHandle, DocumentEditorPro
       return isNearTail && isRecentEdit;
     }, []);
 
-    // 程序化追加一条定稿转录文本
+    // 渲染实时流式 Partial 视觉投影 (绝不修改 EditorState.doc)
+    const setStreamingPartial = useCallback(
+      (payload: StreamingPartialPayload) => {
+        const view = editorViewRef.current;
+        if (!view) return;
+
+        hasStreamingPartialRef.current = !!payload.text.trim();
+        view.dispatch({
+          effects: setStreamingPartialEffect.of(payload),
+        });
+
+        if (isAtBottomRef.current) {
+          instantScrollToBottom();
+        }
+      },
+      [instantScrollToBottom]
+    );
+
+    // 清空流式 Partial 视觉投影
+    const clearStreamingPartial = useCallback(() => {
+      const view = editorViewRef.current;
+      if (!view) return;
+
+      hasStreamingPartialRef.current = false;
+      view.dispatch({
+        effects: clearStreamingPartialEffect.of(),
+      });
+    }, []);
+
+    // 程序化追加一条定稿转录文本 (Final 到来时调用)
     const appendTranscript = useCallback(
       (text: string) => {
         const trimmed = text.trim();
@@ -212,13 +350,13 @@ export const DocumentEditor = forwardRef<DocumentEditorHandle, DocumentEditorPro
         });
 
         if (isAtBottomRef.current) {
-          scrollToBottom();
+          instantScrollToBottom();
         } else {
           unreadCountRef.current += 1;
           onUnreadCountChangeRef.current?.(unreadCountRef.current);
         }
       },
-      [scrollToBottom, isUserActivelyEditingTail, schedulePendingFlushAfterIdle]
+      [instantScrollToBottom, isUserActivelyEditingTail, schedulePendingFlushAfterIdle]
     );
 
     // 辅助函数：创建统一配置的 EditorState
@@ -231,14 +369,13 @@ export const DocumentEditor = forwardRef<DocumentEditorHandle, DocumentEditorPro
           EditorView.lineWrapping,
           placeholder('等待语音输入，或在此直接打字编辑...'),
           typoraTheme,
+          streamingPartialField,
           EditorView.updateListener.of((update) => {
-            // 追踪用户真实输入行为
             const hasUserInput = update.transactions.some(
               (tr) => tr.isUserEvent('input') || tr.isUserEvent('delete')
             );
             if (hasUserInput) {
               lastUserEditAtRef.current = Date.now();
-              // 如果此时有排队的 pending transcripts，用户继续输入必须重新 reschedule 计时器
               if (pendingTranscriptsRef.current.length > 0) {
                 schedulePendingFlushAfterIdle();
               }
@@ -254,7 +391,7 @@ export const DocumentEditor = forwardRef<DocumentEditorHandle, DocumentEditorPro
       });
     }, [schedulePendingFlushAfterIdle]);
 
-    // 清空编辑器全文：彻底重置 EditorState 以抹去 Undo 历史栈，维持 Document/Segment 分层一致性
+    // 清空编辑器全文：彻底重置 EditorState
     const clearContent = useCallback(() => {
       const view = editorViewRef.current;
       if (!view) return;
@@ -265,9 +402,9 @@ export const DocumentEditor = forwardRef<DocumentEditorHandle, DocumentEditorPro
       }
       pendingTranscriptsRef.current = [];
       unreadCountRef.current = 0;
+      hasStreamingPartialRef.current = false;
       onUnreadCountChangeRef.current?.(0);
 
-      // 通过 view.setState 赋予全新空 state，彻底重置 Undo 历史栈
       const emptyState = createNewEditorState('');
       view.setState(emptyState);
 
@@ -283,11 +420,20 @@ export const DocumentEditor = forwardRef<DocumentEditorHandle, DocumentEditorPro
       ref,
       () => ({
         appendTranscript,
+        setStreamingPartial,
+        clearStreamingPartial,
         clearContent,
         getContent,
         scrollToBottom,
       }),
-      [appendTranscript, clearContent, getContent, scrollToBottom]
+      [
+        appendTranscript,
+        setStreamingPartial,
+        clearStreamingPartial,
+        clearContent,
+        getContent,
+        scrollToBottom,
+      ]
     );
 
     // 初始化 CodeMirror 6 (仅在 mount 时执行一次)

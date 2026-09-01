@@ -15,7 +15,7 @@ const bold = text => `\x1b[1m${text}\x1b[0m`;
 
 console.log(cyan('========================================================'));
 console.log(bold(yellow('  智能语音监听与分段转写系统 (SmartVoiceListener)')));
-console.log(cyan('  引擎: sherpa-onnx + SenseVoiceSmall (离线毫秒级 ASR)'));
+console.log(cyan('  架构: Dual-Pass Streaming ASR (Paraformer + SenseVoice/Qwen3)'));
 console.log(cyan('========================================================\n'));
 
 const isWin = process.platform === 'win32';

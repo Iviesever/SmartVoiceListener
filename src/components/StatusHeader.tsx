@@ -34,13 +34,13 @@ export const StatusHeader: React.FC<StatusHeaderProps> = ({
     statusLabel = '监听中';
   } else if (state === 'SPEAKING_ACTIVE') {
     statusClass = 'status-speaking';
-    statusLabel = '收听中';
+    statusLabel = '流式识别';
   } else if (state === 'PAUSE_WAITING') {
     statusClass = 'status-pause';
     statusLabel = '停顿';
   } else if (state === 'TRANSCRIBING') {
     statusClass = 'status-transcribing';
-    statusLabel = '转写中';
+    statusLabel = '定稿校正';
   }
 
   return (
