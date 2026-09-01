@@ -1,106 +1,120 @@
-# SmartVoiceListener 🎙️
+# SmartVoiceListener
 
-> **本地离线、私密安全的 AI 智能语音听写与流式文档工作台**。  
-> 结合持续音频采集、智能静音断句与多模型离线推理，将讲话内容自然连贯地转写成整篇文档。
-
----
-
-## ✨ 核心特性
-
-- 📝 **流式文档工作区（CodeMirror 6 内核）**  
-  告别碎卡片设计，采用一整块纯白极简备忘录文档视图。讲话停顿自动换行追加，支持随时在任意位置自由打字、改错、选词与复制。
-
-- 🛡️ **IME 输入法与尾部打字防干扰**  
-  内置 800ms 真实闲置调度器。当用户正在中文拼音打字或在文末编辑时，新转录自动安全排队，绝不打碎输入法候选框或把正在输入的句子劈断。
-
-- 🎯 **智能视口跟随与未读胶囊**  
-  处于文末时新文字自动平滑滚动触底；当向上翻阅或编辑历史内容时，视口稳固锁定不抢滚动条，并在右下方优雅浮现 `↓ 有 N 条新听写` 快捷胶囊。
-
-- 🚀 **多模型离线矩阵 & GPU 硬件加速**  
-  - **SenseVoice (sherpa-onnx INT8)**：~100ms 极速响应，口语与普通话标点极佳；
-  - **Qwen3-ASR 1.7B**：通义千问 2024 端到端语音大模型，满血吃满 NVIDIA RTX 4070 (8GB) CUDA 张量核心；
-  - **Whisper large-v3 / Kotoba**：OpenAI 旗舰与多语种特化支持；
-  - 顶部下拉框支持一键无缝热切换。
-
-- 🎤 **自适应 VAD 与 0.8s 深度前缀回溯**  
-  根据环境噪音动态调整拾音门限，开口瞬间自动回溯抓取前 800ms 音频，消除首字吞音；带通滤波过滤电流麦杂音，自动峰值响度归一化。
-
-- 💾 **零延迟防丢持久化**  
-  正文与底层 Segments 自动防抖保存，同时深度监听 `pagehide` 与 `visibilitychange`，页面刷新、关闭或切后台时即时同步落盘。
-
-- 🎨 **极简亮色设计系统**  
-  纯白底色，无毛玻璃特效，全内联纯 SVG 矢量图标，响应轻快利落，支持移动端窄屏自适应响应式布局。
+面向长时语音场景的本地离线语音听写与流式文档工作台。基于 Web Audio 持续音频采集、自适应 VAD 静音切句与本地 ASR 离线大模型，将语音输入实时连贯地转录为整篇文档。
 
 ---
 
-## 🚀 极速上手
+## 特性
 
-### 1. 环境准备
-- **Node.js** (>= 18.0)
-- **Python** (3.10+，推荐配备 CUDA 12+ 的 PyTorch 环境以启用 GPU 加速)
+### 1. 流式文档编辑 (CodeMirror 6)
+- 采用单页纯白文档视图，替换碎片化卡片设计；
+- 语音段落结束后自动换行追加，保持正文自然连贯；
+- 支持在文档任意位置自由打字、选词、改错与全选复制；
+- ASR 写入不污染用户撤销栈（`addToHistory: false`），保留原生 `Ctrl+Z` / `Ctrl+Y` 历史记录；
+- 清空工作区时同步重置编辑器状态，维护文档与底层数据层一致性。
 
-### 2. 安装依赖
+### 2. 输入法与打字保护
+- 内置真实 800ms 空闲调度器；
+- 在中文拼音输入法（IME）活跃或用户在文末连续打字时，新转录自动排队暂存；
+- 待用户停笔满 800ms 后平滑追加，防止输入法候选框断流或文本被切断。
+
+### 3. 智能视口跟随
+- 处于文末时，新转录段落自动平滑滚动触底（80px 容差判断）；
+- 向上滚动阅读或编辑历史内容时锁定视口，右下角悬浮显示未读段落提示胶囊，点击后平滑跳转触底并归零。
+
+### 4. 本地多模型矩阵与 GPU 加速
+- **SenseVoice (sherpa-onnx INT8)**: 低延迟极速识别，普通话与标点表现稳定；
+- **Qwen3-ASR 1.7B**: 通义千问端到端语音大模型，支持 NVIDIA RTX 4070 等 CUDA GPU 显存满血加速；
+- **Whisper large-v3 / Kotoba**: 支持高精度与多语种识别；
+- 顶部导航栏支持运行时一键热切换。
+
+### 5. 持续音频流与自适应 VAD
+- 持续环形音频采集，保留开口前约 800ms 前缀缓冲，降低首字丢失概率；
+- 80Hz ~ 7500Hz 语音频段带通滤波，削弱低频隆隆声与高频杂音；
+- 音频自动峰值响度归一化，提升 ASR 识别率。
+
+### 6. 数据分层与即时持久化
+- **分层设计**: 编辑器正文与底层不可变 `TranscriptSegment` 分离，保留原始识别记录与时间戳；
+- **即时落盘**: 防抖保存正文与结构化记录，监听 `pagehide` 与 `visibilitychange` 事件，在刷新、关闭或切后台时同步落盘；
+- **并发与会话隔离**: 讲话起点绑定会话代数（Epoch），严格防止跨会话状态污染与旧请求复活。
+
+---
+
+## 运行要求
+
+- **Node.js**: >= 18.0
+- **Python**: 3.10+（推荐支持 CUDA 12 的 PyTorch 环境）
+- **GPU (可选)**: 支持 NVIDIA CUDA 硬件加速
+
+---
+
+## 快速开始
+
+### 1. 安装前端依赖
 ```bash
-# 安装前端依赖
 npm install
+```
 
-# 安装 Python 离线语音依赖
+### 2. 安装 Python 语音服务依赖
+```bash
+# 基础依赖 (SenseVoice INT8)
 pip install sherpa-onnx soundfile
-# (可选) 启用 Qwen3-ASR 或 Whisper GPU 加速：
+
+# 可选 GPU 加速依赖 (Qwen3-ASR / Whisper)
 # pip install torch torchaudio --index-url https://download.pytorch.org/whl/cu121
 # pip install qwen-asr faster-whisper
 ```
 
-### 3. 一键启动
-在 Windows 下直接双击运行：
+### 3. 启动服务
+在 Windows 环境下直接运行：
 ```bat
 start.bat
 ```
-或者通过 Node 编排脚本启动：
+或使用 Node 编排脚本启动：
 ```bash
 node scripts/start.mjs
 ```
-启动后系统将自动拉起 Python 后端与 Vite 开发服务器，并在浏览器自动打开 **`http://localhost:5174`**。
+服务启动后将自动拉起 Python 后端（8767 端口）与 Vite 前端，并在浏览器中打开 `http://localhost:5174`。
 
 ---
 
-## 🛠️ 技术架构
+## 架构概览
 
 ```text
 React 19 + TypeScript + Vite
 │
-├── TopControlBar (模型热切换 / 启动停止 / 参数设置)
+├── TopControlBar (模型切换 / 监听控制 / 参数设置)
 │
 ├── DocumentWorkspace
-│     └── DocumentEditor (CodeMirror 6 纯白备忘录内核)
+│     └── DocumentEditor (CodeMirror 6 极简纯白内核)
 │           ├── Transaction 统一派发 (addToHistory: false)
-│           ├── IME / 尾部打字 800ms 闲置调度器
+│           ├── IME / 尾部打字 800ms 空闲调度器
 │           └── 80px 容差智能视口与未读悬浮胶囊
 │
-└── BottomStatusBar (实时呼吸状态灯 / 字数统计 / 导出 / 清空)
+└── BottomStatusBar (状态指示灯 / 字数统计 / 导出 / 清空)
 
 Audio Pipeline (Web Audio API)
 │
 ├── 持续主音频流采集 (Master Continuous Recording)
-├── 800ms 环形前缀缓冲 (防吞字回溯)
+├── 800ms 环形前缀缓冲
 ├── 自适应底噪学习与带通滤波 (80Hz ~ 7500Hz)
-└── VAD 静音切句 ➔ Python 本地 ASR 服务 (8767 端口)
+└── VAD 静音切句 -> Python 本地 ASR 服务 (127.0.0.1:8767)
 ```
 
 ---
 
-## ⚙️ 环境变量配置（可选）
+## 环境变量
 
-可通过环境变量按需自定义 ASR 服务端：
+可通过以下环境变量配置 ASR 后端：
 
 | 变量名 | 默认值 | 说明 |
 | :--- | :--- | :--- |
-| `SMARTVOICE_HOST` | `127.0.0.1` | 服务绑定地址（默认仅本地回环，保障私密安全） |
-| `SMARTVOICE_PORT` | `8767` | ASR 服务端监听端口 |
-| `SMARTVOICE_MODELS_DIR` | `D:\resource\AI_WorkSpace\Models` | 外部离线模型存放主目录 |
+| `SMARTVOICE_HOST` | `127.0.0.1` | 服务监听地址（默认仅本地回环） |
+| `SMARTVOICE_PORT` | `8767` | ASR 服务监听端口 |
+| `SMARTVOICE_MODELS_DIR` | `D:\resource\AI_WorkSpace\Models` | 外部离线大模型存放目录 |
 
 ---
 
-## 📄 开源许可证
+## 许可证
 
 本项目基于 [Apache License 2.0](LICENSE) 开源。
