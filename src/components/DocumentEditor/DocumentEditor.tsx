@@ -507,7 +507,7 @@ export const DocumentEditor = forwardRef<DocumentEditorHandle, DocumentEditorPro
       });
     }, [schedulePendingFlushAfterIdle]);
 
-    // 清空编辑器全文：彻底重置 EditorState
+    // 清空编辑器全文：派发原子清空事务
     const clearContent = useCallback(() => {
       const view = editorViewRef.current;
       if (!view) return;
@@ -520,11 +520,14 @@ export const DocumentEditor = forwardRef<DocumentEditorHandle, DocumentEditorPro
       unreadCountRef.current = 0;
       onUnreadCountChangeRef.current?.(0);
 
-      const emptyState = createNewEditorState('');
-      view.setState(emptyState);
+      view.dispatch({
+        changes: { from: 0, to: view.state.doc.length, insert: '' },
+        effects: clearAllStreamingEffect.of(),
+        annotations: Transaction.addToHistory.of(false),
+      });
 
       isAtBottomRef.current = true;
-    }, [createNewEditorState]);
+    }, []);
 
     // 获取全文内容
     const getContent = useCallback(() => {
