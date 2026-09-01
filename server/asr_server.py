@@ -1,3 +1,4 @@
+import asyncio
 import gc
 import io
 import json
@@ -6,11 +7,16 @@ import sys
 import time
 import urllib.parse
 import wave
-from http.server import HTTPServer, BaseHTTPRequestHandler
+from dataclasses import dataclass
 from pathlib import Path
+from typing import Optional, List, Dict, Any
 
 import numpy as np
 import sherpa_onnx
+import uvicorn
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request, UploadFile, File, Form
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 MODELS_DIR = BASE_DIR / "models"
@@ -22,7 +28,7 @@ SERVER_PORT = int(os.environ.get("SMARTVOICE_PORT", "8767"))
 
 os.environ.setdefault("HF_ENDPOINT", "https://hf-mirror.com")
 
-# GPU 能力探测。torch 不是 SenseVoice/sherpa-onnx 最小运行路径的硬依赖。
+# GPU 能力探测
 try:
     import torch
 
@@ -41,7 +47,7 @@ AVAILABLE_MODELS = {
         "name": "SenseVoice (sherpa-onnx INT8 极速)",
         "engine": "sherpa-onnx",
         "type": "低延迟 / 低功耗",
-        "desc": "中文普通话/口语识别，适合分段式常驻监听；当前为离线整段识别",
+        "desc": "中文普通话/口语识别，适合分段式常驻监听；二阶段极速定稿",
         "path": MODELS_DIR / "sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17",
     },
     "qwen3-asr-1.7b": {
@@ -71,13 +77,74 @@ AVAILABLE_MODELS = {
     },
 }
 
+# =========================================================================
+# First-Pass: Streaming Recognizer Engine (sherpa-onnx OnlineParaformer)
+# =========================================================================
+
+class StreamingEngine:
+    def __init__(self):
+        self.recognizer: Optional[sherpa_onnx.OnlineRecognizer] = None
+        self.is_ready = False
+        self._load_engine()
+
+    def _load_engine(self):
+        model_dir = MODELS_DIR / "sherpa-onnx-streaming-paraformer-bilingual-zh-en"
+        encoder = model_dir / "encoder.int8.onnx"
+        decoder = model_dir / "decoder.int8.onnx"
+        tokens = model_dir / "tokens.txt"
+
+        if not (encoder.exists() and decoder.exists() and tokens.exists()):
+            print(f"[!] Warning: Streaming Paraformer files not found in {model_dir}")
+            self.is_ready = False
+            return
+
+        print(f"[*] Loading Streaming Paraformer INT8 engine from {model_dir} ...")
+        t0 = time.perf_counter()
+        try:
+            self.recognizer = sherpa_onnx.OnlineRecognizer.from_paraformer(
+                tokens=str(tokens),
+                encoder=str(encoder),
+                decoder=str(decoder),
+                num_threads=2,
+                sample_rate=16000,
+                feature_dim=80,
+                decoding_method="greedy_search",
+            )
+            self.is_ready = True
+            cost_ms = (time.perf_counter() - t0) * 1000
+            print(f"[✓] Streaming Paraformer engine ready in {cost_ms:.1f}ms")
+        except Exception as e:
+            print(f"[!] Failed to load Streaming Paraformer: {e}", file=sys.stderr)
+            self.is_ready = False
+
+    def create_stream(self) -> Optional[sherpa_onnx.OnlineStream]:
+        if not self.is_ready or self.recognizer is None:
+            return None
+        return self.recognizer.create_stream()
+
+    def decode_stream(self, stream: sherpa_onnx.OnlineStream) -> str:
+        if not self.is_ready or self.recognizer is None or stream is None:
+            return ""
+        while self.recognizer.is_ready(stream):
+            self.recognizer.decode_stream(stream)
+        result = self.recognizer.get_result(stream)
+        if isinstance(result, str):
+            return result.strip()
+        if hasattr(result, "text"):
+            return result.text.strip()
+        return str(result).strip()
+
+
+# =========================================================================
+# Second-Pass: Offline Recognizer Model Manager (模型选择与引擎加载解耦)
+# =========================================================================
 
 class ModelManager:
     def __init__(self):
-        self.active_model_id = "sensevoice-onnx"
+        self.selected_model_id = "sensevoice-onnx"   # 用户选中的默认模型目标
+        self.loaded_engine_model_id = None          # 当前内存中实际装载的模型 ID
         self.current_engine = None
-        self.current_model_id = None
-        self.load_model(self.active_model_id)
+        self.load_engine(self.selected_model_id)
 
     def get_model_list(self):
         result = []
@@ -90,30 +157,31 @@ class ModelManager:
                     "type": info["type"],
                     "desc": info["desc"],
                     "available": info["path"].exists(),
-                    "isActive": model_id == self.active_model_id,
+                    "isActive": model_id == self.selected_model_id,
                     "gpu": CUDA_AVAILABLE,
                 }
             )
         return result
 
-    def load_model(self, model_id: str):
+    def load_engine(self, model_id: str):
         if model_id not in AVAILABLE_MODELS:
             raise ValueError(f"Unknown model_id: {model_id}")
 
         info = AVAILABLE_MODELS[model_id]
-        if self.current_model_id == model_id and self.current_engine is not None:
+        if self.loaded_engine_model_id == model_id and self.current_engine is not None:
             return
 
         if not info["path"].exists() and not info.get("repo_id"):
             raise FileNotFoundError(f"Model path does not exist: {info['path']}")
 
         print(
-            f"\n[*] Switching ASR Model -> [{info['name']}] "
+            f"\n[*] Loading Second-Pass Model -> [{info['name']}] "
             f"(Engine: {info['engine']}, CUDA: {CUDA_AVAILABLE})..."
         )
         started = time.perf_counter()
 
         self.current_engine = None
+        self.loaded_engine_model_id = None
         gc.collect()
         if CUDA_AVAILABLE and torch is not None:
             torch.cuda.empty_cache()
@@ -171,24 +239,23 @@ class ModelManager:
                 device_map="cuda:0" if CUDA_AVAILABLE else "cpu",
             )
 
-        self.current_model_id = model_id
-        self.active_model_id = model_id
+        self.loaded_engine_model_id = model_id
         cost_ms = (time.perf_counter() - started) * 1000
 
         if CUDA_AVAILABLE and torch is not None:
             vram_mb = torch.cuda.memory_allocated() / 1024**2
             print(
-                f"[✓] Model [{info['name']}] loaded in {cost_ms:.1f}ms "
+                f"[✓] Second-Pass Model [{info['name']}] loaded in {cost_ms:.1f}ms "
                 f"(GPU VRAM allocated: {vram_mb:.1f} MB)\n"
             )
         else:
-            print(f"[✓] Model [{info['name']}] loaded in {cost_ms:.1f}ms\n")
+            print(f"[✓] Second-Pass Model [{info['name']}] loaded in {cost_ms:.1f}ms\n")
 
-    def transcribe(self, samples: np.ndarray, sample_rate: int) -> str:
+    def transcribe(self, samples: np.ndarray, sample_rate: int = 16000) -> str:
         if self.current_engine is None:
-            raise RuntimeError("No model engine loaded.")
+            raise RuntimeError("No second-pass model loaded.")
 
-        info = AVAILABLE_MODELS[self.active_model_id]
+        info = AVAILABLE_MODELS[self.loaded_engine_model_id]
 
         if info["engine"] == "sherpa-onnx":
             stream = self.current_engine.create_stream()
@@ -199,7 +266,7 @@ class ModelManager:
         if info["engine"] == "faster-whisper":
             segments, _ = self.current_engine.transcribe(
                 samples,
-                language="zh" if "kotoba" not in self.active_model_id else "ja",
+                language="zh" if "kotoba" not in self.loaded_engine_model_id else "ja",
                 beam_size=1,
                 temperature=0.0,
                 vad_filter=True,
@@ -213,7 +280,6 @@ class ModelManager:
             )
             if results:
                 raw_text = results[0].text.strip()
-                # 临时常用繁转简映射。后续应替换为完整 OpenCC/模型级 ITN 流程。
                 tr_map = str.maketrans(
                     {
                         "開": "开",
@@ -253,10 +319,161 @@ class ModelManager:
         return ""
 
 
+def normalize_audio_for_inference(samples: np.ndarray) -> np.ndarray:
+    if len(samples) == 0:
+        return samples
+    max_abs = float(np.max(np.abs(samples)))
+    if max_abs > 1e-4:
+        gain = min(4.0, 0.85 / max_abs)
+        return np.clip(samples * gain, -1.0, 1.0).astype(np.float32)
+    return samples
+
+
+# =========================================================================
+# Second-Pass Inference Scheduler (Semaphore & Error Fallback Guard)
+# =========================================================================
+
+@dataclass
+class FinalJob:
+    session_epoch: int
+    segment_id: str
+    model_id: str
+    samples: np.ndarray
+    sample_rate: int = 16000
+    fallback_text: str = ""
+
+@dataclass
+class FinalResult:
+    session_epoch: int
+    segment_id: str
+    text: str
+    model_id: str
+    cost_ms: float
+    final_source: str  # 'second_pass' | 'streaming_fallback'
+
+
+class OfflineInferenceScheduler:
+    def __init__(self, model_mgr: ModelManager):
+        self.model_mgr = model_mgr
+        self.semaphore = asyncio.Semaphore(1)
+
+    async def execute_job(self, job: FinalJob) -> FinalResult:
+        async with self.semaphore:
+            t0 = time.perf_counter()
+            try:
+                # 确保当前 engine 实例加载了 job 所请求的模型（不覆盖 user selected_model_id）
+                if self.model_mgr.loaded_engine_model_id != job.model_id:
+                    await asyncio.to_thread(self.model_mgr.load_engine, job.model_id)
+
+                norm_samples = normalize_audio_for_inference(job.samples)
+                # 在后台线程执行推理，不阻塞 asyncio 事件循环
+                text = await asyncio.to_thread(
+                    self.model_mgr.transcribe, norm_samples, job.sample_rate
+                )
+                cost_ms = (time.perf_counter() - t0) * 1000
+                final_text = text.strip() if text else job.fallback_text.strip()
+                source = "second_pass" if text and text.strip() else "streaming_fallback"
+
+                return FinalResult(
+                    session_epoch=job.session_epoch,
+                    segment_id=job.segment_id,
+                    text=final_text,
+                    model_id=job.model_id,
+                    cost_ms=cost_ms,
+                    final_source=source,
+                )
+            except Exception as e:
+                cost_ms = (time.perf_counter() - t0) * 1000
+                print(f"[!] Second-Pass Inference error for {job.segment_id}: {e}", file=sys.stderr)
+                return FinalResult(
+                    session_epoch=job.session_epoch,
+                    segment_id=job.segment_id,
+                    text=job.fallback_text.strip(),
+                    model_id=job.model_id,
+                    cost_ms=cost_ms,
+                    final_source="streaming_fallback",
+                )
+
+
+# =========================================================================
+# FastAPI Application & WebSocket Stream Endpoint
+# =========================================================================
+
+streaming_engine = StreamingEngine()
 model_manager = ModelManager()
+inference_scheduler = OfflineInferenceScheduler(model_manager)
+
+app = FastAPI(title="SmartVoiceListener Two-Pass ASR Server", version="1.0.0")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 
-def read_wav_data(data_bytes):
+@app.get("/api/health")
+async def get_health():
+    active_info = AVAILABLE_MODELS.get(model_manager.selected_model_id, {})
+    vram_info = ""
+    if CUDA_AVAILABLE and torch is not None:
+        vram_info = f" (GPU VRAM: {torch.cuda.memory_allocated() / 1024**2:.1f}MB)"
+
+    return {
+        "status": "ok",
+        "online": True,
+        "model": active_info.get("name", "Unknown") + vram_info,
+        "activeModelId": model_manager.selected_model_id,
+        "streamingEngineReady": streaming_engine.is_ready,
+        "gpu": GPU_NAME if CUDA_AVAILABLE else "CPU",
+    }
+
+
+@app.get("/api/models")
+async def get_models():
+    return {
+        "models": model_manager.get_model_list(),
+        "activeModelId": model_manager.selected_model_id,
+        "gpu": GPU_NAME if CUDA_AVAILABLE else "CPU",
+    }
+
+
+@app.post("/api/switch_model")
+async def post_switch_model(request: Request):
+    try:
+        data = await request.json()
+        model_id = data.get("modelId")
+        if not model_id or model_id not in AVAILABLE_MODELS:
+            return JSONResponse(status_code=400, content={"error": f"Invalid modelId: {model_id}"})
+
+        previous_model = model_manager.selected_model_id
+
+        # 保护：在 scheduler 信号量内先装载；若发生异常自动回滚重载 previous_model
+        async with inference_scheduler.semaphore:
+            try:
+                await asyncio.to_thread(model_manager.load_engine, model_id)
+                model_manager.selected_model_id = model_id
+            except Exception as exc:
+                print(f"[!] Failed to switch model to {model_id}, rolling back to {previous_model}: {exc}", file=sys.stderr)
+                try:
+                    await asyncio.to_thread(model_manager.load_engine, previous_model)
+                except Exception as rb_err:
+                    print(f"[!] Rollback to {previous_model} failed: {rb_err}", file=sys.stderr)
+                raise exc
+
+        active_info = AVAILABLE_MODELS[model_manager.selected_model_id]
+        return {
+            "success": True,
+            "activeModelId": model_manager.selected_model_id,
+            "modelName": active_info["name"],
+        }
+    except Exception as exc:
+        return JSONResponse(status_code=500, content={"error": str(exc)})
+
+
+def read_wav_data(data_bytes: bytes):
     with wave.open(io.BytesIO(data_bytes), "rb") as wav_file:
         num_channels = wav_file.getnchannels()
         sample_width = wav_file.getsampwidth()
@@ -277,145 +494,255 @@ def read_wav_data(data_bytes):
         return samples, sample_rate
 
 
-class AsrHandler(BaseHTTPRequestHandler):
-    def _send_cors_headers(self):
-        # 服务默认只绑定 loopback，因此允许本机浏览器开发前端跨端口访问。
-        self.send_header("Access-Control-Allow-Origin", "*")
-        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-        self.send_header("Access-Control-Allow-Headers", "Content-Type")
+@app.post("/api/asr")
+async def post_legacy_asr(
+    request: Request,
+    file: Optional[UploadFile] = File(None),
+    modelId: Optional[str] = Form(None),
+):
+    try:
+        if file is not None:
+            wav_bytes = await file.read()
+        else:
+            wav_bytes = await request.body()
 
-    def _send_json(self, status_code: int, payload: dict):
-        body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-        self.send_response(status_code)
-        self.send_header("Content-Type", "application/json; charset=utf-8")
-        self._send_cors_headers()
-        self.end_headers()
-        self.wfile.write(body)
+        if not wav_bytes:
+            return JSONResponse(status_code=400, content={"error": "No audio data received"})
 
-    def do_OPTIONS(self):
-        self.send_response(204)
-        self._send_cors_headers()
-        self.end_headers()
+        started = time.perf_counter()
+        samples, sample_rate = read_wav_data(wav_bytes)
+        norm_samples = normalize_audio_for_inference(samples)
 
-    def do_GET(self):
-        parsed = urllib.parse.urlparse(self.path)
+        # 保护：通过 inference_scheduler.semaphore 进行线程与模型隔离保护 (支持指定模型或回退默认模型)
+        target_model = modelId if (modelId and modelId in AVAILABLE_MODELS) else model_manager.selected_model_id
+        async with inference_scheduler.semaphore:
+            if model_manager.loaded_engine_model_id != target_model:
+                await asyncio.to_thread(model_manager.load_engine, target_model)
+            text = await asyncio.to_thread(model_manager.transcribe, norm_samples, sample_rate)
 
-        if parsed.path == "/api/health":
-            active_info = AVAILABLE_MODELS.get(model_manager.active_model_id, {})
-            vram_info = ""
-            if CUDA_AVAILABLE and torch is not None:
-                vram_info = f" (GPU VRAM: {torch.cuda.memory_allocated() / 1024**2:.1f}MB)"
+        cost_ms = (time.perf_counter() - started) * 1000
+        duration_sec = len(samples) / sample_rate
 
-            self._send_json(
-                200,
-                {
-                    "status": "ok",
-                    "online": True,
-                    "model": active_info.get("name", "Unknown") + vram_info,
-                    "activeModelId": model_manager.active_model_id,
-                    "gpu": GPU_NAME if CUDA_AVAILABLE else "CPU",
-                },
-            )
-            return
+        print(
+            f"[{target_model}] Legacy Recognized "
+            f"({duration_sec:.2f}s audio in {cost_ms:.1f}ms): {text}"
+        )
 
-        if parsed.path == "/api/models":
-            self._send_json(
-                200,
-                {
-                    "models": model_manager.get_model_list(),
-                    "activeModelId": model_manager.active_model_id,
-                    "gpu": GPU_NAME if CUDA_AVAILABLE else "CPU",
-                },
-            )
-            return
+        return {
+            "text": text,
+            "duration": duration_sec,
+            "costMs": cost_ms,
+            "modelId": target_model,
+        }
+    except Exception as exc:
+        print(f"[!] Legacy ASR Error: {exc}", file=sys.stderr)
+        return JSONResponse(status_code=500, content={"error": str(exc)})
 
-        self._send_json(404, {"error": "Not found"})
 
-    def do_POST(self):
-        parsed = urllib.parse.urlparse(self.path)
-        content_length = int(self.headers.get("Content-Length", 0))
-        body = self.rfile.read(content_length)
+# =========================================================================
+# WebSocket Full-Duplex Streaming Endpoint
+# =========================================================================
 
-        if parsed.path == "/api/switch_model":
-            try:
-                data = json.loads(body.decode("utf-8"))
-                model_id = data.get("modelId")
-                model_manager.load_model(model_id)
-                active_info = AVAILABLE_MODELS[model_manager.active_model_id]
-                self._send_json(
-                    200,
+@app.websocket("/api/stream")
+async def websocket_stream_endpoint(ws: WebSocket):
+    await ws.accept()
+
+    stream: Optional[sherpa_onnx.OnlineStream] = streaming_engine.create_stream()
+    active_segment_id: Optional[str] = None
+    active_session_epoch: int = 1
+    active_segment_model_id: str = model_manager.selected_model_id
+    audio_chunks: List[np.ndarray] = []
+    last_partial_text: str = ""
+    last_revision: int = 0
+
+    print(f"[*] WebSocket client connected: {ws.client}")
+
+    async def run_and_send_final(job: FinalJob):
+        result = await inference_scheduler.execute_job(job)
+        duration_sec = len(job.samples) / job.sample_rate
+        print(
+            f"[✓ Final] {result.segment_id} ({duration_sec:.2f}s audio in {result.cost_ms:.1f}ms, "
+            f"model: {result.model_id}, source: {result.final_source}): {result.text}"
+        )
+        try:
+            # 关键修复 P0-5: 绝不发送空的 Final 回包，避免 Client 误认领
+            if not result.text:
+                await ws.send_json(
                     {
-                        "success": True,
-                        "activeModelId": model_manager.active_model_id,
-                        "modelName": active_info["name"],
-                    },
+                        "type": "error",
+                        "sessionEpoch": result.session_epoch,
+                        "segmentId": result.segment_id,
+                        "message": "Recognition resulted in empty text",
+                    }
                 )
-            except Exception as exc:
-                self._send_json(500, {"error": str(exc)})
-            return
+                return
 
-        if parsed.path == "/api/asr":
-            try:
-                content_type = self.headers.get("Content-Type", "")
-                wav_bytes = None
+            await ws.send_json(
+                {
+                    "type": "final",
+                    "sessionEpoch": result.session_epoch,
+                    "segmentId": result.segment_id,
+                    "text": result.text,
+                    "modelId": result.model_id,
+                    "costMs": result.cost_ms,
+                    "finalSource": result.final_source,
+                }
+            )
+        except Exception:
+            pass
 
-                if "multipart/form-data" in content_type:
-                    boundary_value = content_type.split("boundary=")[-1].strip().strip('"')
-                    boundary = boundary_value.encode("utf-8")
-                    parts = body.split(b"--" + boundary)
-                    for part in parts:
-                        if b'filename="' in part:
-                            header_end = part.find(b"\r\n\r\n")
-                            if header_end != -1:
-                                wav_bytes = part[header_end + 4 :].rstrip(b"\r\n")
-                                break
+    try:
+        while True:
+            message = await ws.receive()
+            msg_type = message.get("type")
+
+            if msg_type == "websocket.disconnect":
+                break
+
+            # 1. 文本控制帧 (JSON Frame)
+            if "text" in message:
+                raw_text = message["text"]
+                try:
+                    data = json.loads(raw_text)
+                except Exception:
+                    continue
+
+                event_type = data.get("type")
+
+                if event_type == "stream_init":
+                    await ws.send_json(
+                        {
+                            "type": "stream_ready",
+                            "protocolVersion": 1,
+                            "sampleRate": 16000,
+                            "streamingReady": streaming_engine.is_ready,
+                            "activeModelId": model_manager.selected_model_id,
+                        }
+                    )
+
+                elif event_type == "speech_start":
+                    active_segment_id = data.get("segmentId", f"seg-{int(time.time()*1000)}")
+                    active_session_epoch = data.get("sessionEpoch", 1)
+                    # 关键优化 P1-3: 冻结当前说话段所请求的模型
+                    req_model = data.get("modelId")
+                    active_segment_model_id = req_model if (req_model and req_model in AVAILABLE_MODELS) else model_manager.selected_model_id
+                    audio_chunks = []
+                    last_partial_text = ""
+                    last_revision = 0
+                    stream = streaming_engine.create_stream()
+
+                elif event_type == "speech_end":
+                    seg_id = data.get("segmentId")
+                    epoch = data.get("sessionEpoch", active_session_epoch)
+
+                    # 关键优化 P1-4: 告诉 OnlineRecognizer 输入已完成并解码最后尾部余音
+                    if stream is not None and streaming_engine.is_ready:
+                        try:
+                            stream.input_finished()
+                            tail_text = streaming_engine.decode_stream(stream)
+                            if tail_text:
+                                last_partial_text = tail_text
+                        except Exception as flush_err:
+                            print(f"[!] Error flushing stream: {flush_err}", file=sys.stderr)
+
+                    if seg_id == active_segment_id and audio_chunks:
+                        sealed_audio = np.concatenate(audio_chunks)
+                        captured_model = active_segment_model_id
+                        job = FinalJob(
+                            session_epoch=epoch,
+                            segment_id=seg_id,
+                            model_id=captured_model,
+                            samples=sealed_audio,
+                            sample_rate=16000,
+                            fallback_text=last_partial_text,
+                        )
+                        # 立即重置流式识别槽位以供下一段随时使用
+                        stream = streaming_engine.create_stream()
+                        active_segment_id = None
+                        audio_chunks = []
+                        last_partial_text = ""
+                        last_revision = 0
+
+                        # 异步调度二阶段推理，不阻塞 WebSocket 接收循环
+                        asyncio.create_task(run_and_send_final(job))
+                    else:
+                        active_segment_id = None
+                        audio_chunks = []
+                        stream = streaming_engine.create_stream()
+
+                elif event_type == "speech_cancel":
+                    active_segment_id = None
+                    audio_chunks = []
+                    last_partial_text = ""
+                    stream = streaming_engine.create_stream()
+
+            # 2. 二进制音频数据帧 (Binary Frame: Float32 PCM 16kHz)
+            elif "bytes" in message:
+                raw_bytes = message["bytes"]
+                if not raw_bytes or active_segment_id is None:
+                    continue
+
+                # 解析 Float32Array PCM
+                if len(raw_bytes) % 4 == 0:
+                    samples = np.frombuffer(raw_bytes, dtype=np.float32)
+                elif len(raw_bytes) % 2 == 0:
+                    samples = np.frombuffer(raw_bytes, dtype=np.int16).astype(np.float32) / 32768.0
                 else:
-                    wav_bytes = body
+                    continue
 
-                if not wav_bytes:
-                    self._send_json(400, {"error": "No audio data received"})
-                    return
+                # 1. 永远紧凑累加到二阶段音频缓存 (即便 streaming 引擎不可用也能定稿)
+                audio_chunks.append(samples.copy())
 
-                started = time.perf_counter()
-                samples, sample_rate = read_wav_data(wav_bytes)
-                text = model_manager.transcribe(samples, sample_rate)
-                cost_ms = (time.perf_counter() - started) * 1000
-                duration_sec = len(samples) / sample_rate
+                # 2. 若 Streaming 引擎就绪，喂入 OnlineRecognizer 进行增量解码
+                if stream is not None and streaming_engine.is_ready:
+                    stream.accept_waveform(16000, samples)
+                    current_text = streaming_engine.decode_stream(stream)
 
-                print(
-                    f"[{model_manager.active_model_id}] Recognized "
-                    f"({duration_sec:.2f}s audio in {cost_ms:.1f}ms): {text}"
-                )
+                    if current_text and current_text != last_partial_text:
+                        last_partial_text = current_text
+                        last_revision += 1
+                        await ws.send_json(
+                            {
+                                "type": "partial",
+                                "sessionEpoch": active_session_epoch,
+                                "segmentId": active_segment_id,
+                                "revision": last_revision,
+                                "text": current_text,
+                            }
+                        )
 
-                self._send_json(
-                    200,
-                    {
-                        "text": text,
-                        "duration": duration_sec,
-                        "costMs": cost_ms,
-                        "modelId": model_manager.active_model_id,
-                    },
-                )
-            except Exception as exc:
-                print(f"[!] ASR Error: {exc}", file=sys.stderr)
-                self._send_json(500, {"error": str(exc)})
-            return
+                # 防御性单段 120 秒最大时长保险（避免与前端 90s 主控竞争，纯做异常断网兜底）
+                total_samples = sum(len(c) for c in audio_chunks)
+                if total_samples >= 16000 * 120:
+                    sealed_audio = np.concatenate(audio_chunks)
+                    captured_model = active_segment_model_id
+                    job = FinalJob(
+                        session_epoch=active_session_epoch,
+                        segment_id=active_segment_id,
+                        model_id=captured_model,
+                        samples=sealed_audio,
+                        sample_rate=16000,
+                        fallback_text=last_partial_text,
+                    )
+                    stream = streaming_engine.create_stream()
+                    active_segment_id = None
+                    audio_chunks = []
+                    last_partial_text = ""
+                    last_revision = 0
+                    asyncio.create_task(run_and_send_final(job))
 
-        self._send_json(404, {"error": "Not found"})
+    except WebSocketDisconnect:
+        print(f"[*] WebSocket client disconnected: {ws.client}")
+    except Exception as e:
+        print(f"[!] WebSocket error: {e}", file=sys.stderr)
+    finally:
+        audio_chunks.clear()
+        stream = None
 
 
 def run_server(host=SERVER_HOST, port=SERVER_PORT):
-    server = HTTPServer((host, port), AsrHandler)
-    print(f"[*] SmartVoiceListener ASR server running at http://{host}:{port}")
-    if host not in {"127.0.0.1", "localhost", "::1"}:
-        print("[!] Warning: ASR server is exposed beyond loopback. Protect the port appropriately.")
-
-    try:
-        server.serve_forever()
-    except KeyboardInterrupt:
-        print("\n[*] Shutting down server...")
-    finally:
-        server.server_close()
+    print(f"[*] SmartVoiceListener Two-Pass Server running on http://{host}:{port}")
+    uvicorn.run(app, host=host, port=port, log_level="info")
 
 
 if __name__ == "__main__":

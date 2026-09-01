@@ -322,6 +322,70 @@ html, body {
   background-color: #bfdbfe !important;
 }
 
+/* ========================================================================= */
+/* CodeMirror 6 Block Widget: Inline Ephemeral Partial (灰字 + 呼吸光标) */
+/* ========================================================================= */
+.cm-streaming-block {
+  display: block;
+  margin-top: 0.8em;
+  padding: 0;
+  color: #64748b !important; /* Slate-500 */
+  font-size: 1.05rem !important;
+  line-height: 1.6 !important;
+  font-family: inherit !important;
+  white-space: pre-wrap !important;
+  word-break: break-word !important;
+  user-select: none;
+  pointer-events: none;
+  animation: cmPartialFadeIn 0.12s ease-out;
+}
+
+.cm-streaming-segment {
+  display: block;
+  margin-top: 0.6em;
+}
+
+.cm-streaming-segment:first-child {
+  margin-top: 0;
+}
+
+.cm-streaming-text {
+  color: #64748b !important;
+  transition: color 0.15s ease;
+}
+
+.cm-streaming-caret {
+  display: inline-block;
+  margin-left: 2px;
+  color: #2563eb;
+  font-size: 1em;
+  line-height: 1;
+  vertical-align: baseline;
+  animation: cmCaretBreathe 1s infinite ease-in-out;
+}
+
+.cm-streaming-caret.frozen {
+  animation: none;
+  opacity: 0.45;
+  color: #94a3b8;
+}
+
+@keyframes cmCaretBreathe {
+  0%, 100% {
+    opacity: 1;
+    transform: scale(1);
+  }
+  50% {
+    opacity: 0.25;
+    transform: scale(0.95);
+  }
+}
+
+@keyframes cmPartialFadeIn {
+  from { opacity: 0.7; }
+  to { opacity: 1; }
+}
+
 /* 未读听写悬浮胶囊 */
 .unread-anchor-badge {
   position: absolute;

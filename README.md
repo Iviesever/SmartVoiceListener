@@ -57,8 +57,8 @@ npm install
 
 ### 2. 安装 Python 语音服务依赖
 ```bash
-# 基础依赖 (SenseVoice INT8)
-pip install sherpa-onnx soundfile
+# 安装服务端依赖 (FastAPI / uvicorn / sherpa-onnx / soundfile 等)
+pip install -r requirements.txt
 
 # 可选 GPU 加速依赖 (Qwen3-ASR / Whisper)
 # pip install torch torchaudio --index-url https://download.pytorch.org/whl/cu121

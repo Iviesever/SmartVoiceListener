@@ -1,10 +1,16 @@
 import { useEffect, useRef, useImperativeHandle, forwardRef, useCallback } from 'react';
-import { EditorState, Transaction } from '@codemirror/state';
-import { EditorView, keymap, placeholder } from '@codemirror/view';
+import { EditorState, Transaction, StateField, StateEffect } from '@codemirror/state';
+import { EditorView, keymap, placeholder, Decoration, DecorationSet, WidgetType } from '@codemirror/view';
 import { defaultKeymap, history, historyKeymap } from '@codemirror/commands';
+import { EphemeralSegment } from '../../types';
 
 export interface DocumentEditorHandle {
   appendTranscript: (text: string) => void;
+  setStreamingPartial: (segmentId: string, text: string) => void;
+  sealStreamingPartial: (segmentId: string) => void;
+  commitStreamingFinal: (segmentId: string, finalText: string) => void;
+  clearStreamingPartial: (segmentId?: string) => void;
+  flushPendingTranscriptsNow: () => string;
   clearContent: () => void;
   getContent: () => string;
   scrollToBottom: () => void;
@@ -16,7 +22,153 @@ interface DocumentEditorProps {
   onUnreadCountChange?: (count: number) => void;
 }
 
-// 强制显式设置 CodeMirror 6 的纯白高对比度主题
+// -----------------------------------------------------------------------------
+// CodeMirror 6 Block Widget for Multi-Segment Ephemeral Tail
+// -----------------------------------------------------------------------------
+
+export const setStreamingPartialEffect = StateEffect.define<EphemeralSegment>();
+export const sealStreamingPartialEffect = StateEffect.define<string>();
+export const commitStreamingFinalEffect = StateEffect.define<string>();
+export const clearAllStreamingEffect = StateEffect.define<void>();
+
+class StreamingTailBlockWidget extends WidgetType {
+  constructor(readonly segments: EphemeralSegment[]) {
+    super();
+  }
+
+  toDOM(): HTMLElement {
+    const wrap = document.createElement('div');
+    wrap.className = 'cm-streaming-block';
+
+    for (const seg of this.segments) {
+      const segEl = document.createElement('div');
+      segEl.className = 'cm-streaming-segment';
+      segEl.dataset.segmentId = seg.segmentId;
+
+      const textSpan = document.createElement('span');
+      textSpan.className = 'cm-streaming-text';
+      textSpan.textContent = seg.text;
+      segEl.appendChild(textSpan);
+
+      const caret = document.createElement('span');
+      caret.className = `cm-streaming-caret ${seg.status === 'sealed' ? 'frozen' : ''}`;
+      caret.textContent = '▌';
+      segEl.appendChild(caret);
+
+      wrap.appendChild(segEl);
+    }
+
+    return wrap;
+  }
+
+  updateDOM(dom: HTMLElement): boolean {
+    const existingSegEls = Array.from(dom.querySelectorAll<HTMLElement>('.cm-streaming-segment'));
+    
+    // 若段落数量不一致，直接整块重新渲染
+    if (existingSegEls.length !== this.segments.length) {
+      return false;
+    }
+
+    for (let i = 0; i < this.segments.length; i++) {
+      const seg = this.segments[i];
+      const el = existingSegEls[i];
+      if (!el || el.dataset.segmentId !== seg.segmentId) {
+        return false;
+      }
+
+      const textSpan = el.querySelector('.cm-streaming-text');
+      const caret = el.querySelector('.cm-streaming-caret');
+      if (textSpan && textSpan.textContent !== seg.text) {
+        textSpan.textContent = seg.text;
+      }
+      if (caret) {
+        caret.className = `cm-streaming-caret ${seg.status === 'sealed' ? 'frozen' : ''}`;
+      }
+    }
+    return true;
+  }
+
+  eq(other: StreamingTailBlockWidget): boolean {
+    if (other.segments.length !== this.segments.length) return false;
+    for (let i = 0; i < this.segments.length; i++) {
+      const a = this.segments[i];
+      const b = other.segments[i];
+      if (a.segmentId !== b.segmentId || a.text !== b.text || a.status !== b.status) {
+        return false;
+      }
+    }
+    return true;
+  }
+}
+
+export const streamingTailField = StateField.define<{ segments: EphemeralSegment[]; decorations: DecorationSet }>({
+  create() {
+    return { segments: [], decorations: Decoration.none };
+  },
+  update(value, tr) {
+    let segments = [...value.segments];
+    let changed = false;
+
+    for (const effect of tr.effects) {
+      if (effect.is(setStreamingPartialEffect)) {
+        const incoming = effect.value;
+        const trimmed = incoming.text.trim();
+        if (!trimmed) continue;
+
+        const idx = segments.findIndex((s) => s.segmentId === incoming.segmentId);
+        if (idx >= 0) {
+          segments[idx] = { ...incoming, text: trimmed };
+        } else {
+          segments.push({ ...incoming, text: trimmed });
+        }
+        changed = true;
+      } else if (effect.is(sealStreamingPartialEffect)) {
+        const segId = effect.value;
+        const idx = segments.findIndex((s) => s.segmentId === segId);
+        if (idx >= 0 && segments[idx].status !== 'sealed') {
+          segments[idx] = { ...segments[idx], status: 'sealed' };
+          changed = true;
+        }
+      } else if (effect.is(commitStreamingFinalEffect)) {
+        const segId = effect.value;
+        const next = segments.filter((s) => s.segmentId !== segId);
+        if (next.length !== segments.length) {
+          segments = next;
+          changed = true;
+        }
+      } else if (effect.is(clearAllStreamingEffect)) {
+        if (segments.length > 0) {
+          segments = [];
+          changed = true;
+        }
+      }
+    }
+
+    if (changed || tr.docChanged) {
+      if (segments.length === 0) {
+        return { segments: [], decorations: Decoration.none };
+      }
+      const docLen = tr.state.doc.length;
+      const widget = Decoration.widget({
+        widget: new StreamingTailBlockWidget(segments),
+        side: 1,
+        block: true,
+      });
+      return {
+        segments,
+        decorations: Decoration.set([widget.range(docLen)]),
+      };
+    }
+
+    return value;
+  },
+  provide: (f) => EditorView.decorations.from(f, (val) => val.decorations),
+});
+
+// -----------------------------------------------------------------------------
+// 高对比度纯白主题配置
+// -----------------------------------------------------------------------------
+
 const typoraTheme = EditorView.theme({
   '&': {
     height: '100%',
@@ -72,6 +224,10 @@ const typoraTheme = EditorView.theme({
   },
 });
 
+// -----------------------------------------------------------------------------
+// DocumentEditor 组件
+// -----------------------------------------------------------------------------
+
 export const DocumentEditor = forwardRef<DocumentEditorHandle, DocumentEditorProps>(
   ({ initialContent = '', onDocChange, onUnreadCountChange }, ref) => {
     const editorContainerRef = useRef<HTMLDivElement | null>(null);
@@ -85,13 +241,13 @@ export const DocumentEditor = forwardRef<DocumentEditorHandle, DocumentEditorPro
 
     // 控制器内部状态
     const isComposingRef = useRef<boolean>(false);
-    const pendingTranscriptsRef = useRef<string[]>([]);
+    const pendingTranscriptsRef = useRef<{ segmentId?: string; text: string }[]>([]);
     const isAtBottomRef = useRef<boolean>(true);
     const unreadCountRef = useRef<number>(0);
     const lastUserEditAtRef = useRef<number>(0);
     const tailEditTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
-    // 智能滚动到文档底部
+    // 人工跳转滚动到文档底部 (平滑动画)
     const scrollToBottom = useCallback(() => {
       const view = editorViewRef.current;
       if (!view) return;
@@ -107,36 +263,52 @@ export const DocumentEditor = forwardRef<DocumentEditorHandle, DocumentEditorPro
       onUnreadCountChangeRef.current?.(0);
     }, []);
 
-    // 实际执行队列消费与追加写入
+    // 流式增量更新时的即时置底 (requestAnimationFrame 合并置底)
+    const instantScrollToBottom = useCallback(() => {
+      const view = editorViewRef.current;
+      if (!view) return;
+
+      requestAnimationFrame(() => {
+        const scroller = view.scrollDOM;
+        scroller.scrollTop = scroller.scrollHeight;
+      });
+    }, []);
+
+    // 实际执行队列消费与追加写入 (原子性写入 doc 并移除对应的 ephemeral segment)
     const flushPendingTranscripts = useCallback(() => {
       if (pendingTranscriptsRef.current.length === 0) return;
       const view = editorViewRef.current;
       if (!view) return;
 
-      const textsToInsert = [...pendingTranscriptsRef.current];
+      const itemsToInsert = [...pendingTranscriptsRef.current];
       pendingTranscriptsRef.current = [];
 
-      for (const text of textsToInsert) {
+      for (const item of itemsToInsert) {
         const docLength = view.state.doc.length;
-        const insertText = (docLength > 0 ? '\n\n' : '') + text;
+        const insertText = (docLength > 0 ? '\n\n' : '') + item.text;
 
-        // ASR 自动追加不进入用户 Undo 栈
+        const effects: StateEffect<any>[] = [];
+        if (item.segmentId) {
+          effects.push(commitStreamingFinalEffect.of(item.segmentId));
+        }
+
         view.dispatch({
           changes: { from: docLength, insert: insertText },
+          effects,
           annotations: Transaction.addToHistory.of(false),
           userEvent: 'input.asr',
         });
 
         if (isAtBottomRef.current) {
-          scrollToBottom();
+          instantScrollToBottom();
         } else {
           unreadCountRef.current += 1;
           onUnreadCountChangeRef.current?.(unreadCountRef.current);
         }
       }
-    }, [scrollToBottom]);
+    }, [instantScrollToBottom]);
 
-    // 优化：首次调度即按剩余时间 (800 - elapsed) 计算，真正做到“自最后一次敲键起满 800ms 就追加”
+    // 尾部打字闲置调度
     const schedulePendingFlushAfterIdle = useCallback(() => {
       if (tailEditTimerRef.current) {
         clearTimeout(tailEditTimerRef.current);
@@ -146,20 +318,17 @@ export const DocumentEditor = forwardRef<DocumentEditorHandle, DocumentEditorPro
       if (pendingTranscriptsRef.current.length === 0) return;
 
       const tryFlush = () => {
-        // 1. 若仍处于输入法 composition 状态，继续等待
         if (isComposingRef.current) {
           tailEditTimerRef.current = setTimeout(tryFlush, 200);
           return;
         }
 
-        // 2. 严格校验距离最后一次用户真实打字是否满 800ms
         const elapsed = Date.now() - lastUserEditAtRef.current;
         if (elapsed < 800) {
           tailEditTimerRef.current = setTimeout(tryFlush, 800 - elapsed);
           return;
         }
 
-        // 3. 用户确实已闲置 800ms，安全出队写入
         flushPendingTranscripts();
       };
 
@@ -178,7 +347,75 @@ export const DocumentEditor = forwardRef<DocumentEditorHandle, DocumentEditorPro
       return isNearTail && isRecentEdit;
     }, []);
 
-    // 程序化追加一条定稿转录文本
+    // 1. 设置/更新某一段的实时流式 Partial (live 状态)
+    const setStreamingPartial = useCallback(
+      (segmentId: string, text: string) => {
+        const view = editorViewRef.current;
+        if (!view) return;
+
+        view.dispatch({
+          effects: setStreamingPartialEffect.of({
+            segmentId,
+            text,
+            status: 'live',
+          }),
+        });
+
+        if (isAtBottomRef.current) {
+          instantScrollToBottom();
+        }
+      },
+      [instantScrollToBottom]
+    );
+
+    // 2. 封存某一段流式 Partial (停顿结束，等待 Final，光标静止防止闪断)
+    const sealStreamingPartial = useCallback((segmentId: string) => {
+      const view = editorViewRef.current;
+      if (!view) return;
+
+      view.dispatch({
+        effects: sealStreamingPartialEffect.of(segmentId),
+      });
+    }, []);
+
+    // 3. 提交 Final 结果：将该段正式写入文档，同时仅移除该段对应的 ephemeral 投影（不影响正在录音的其他段）
+    const commitStreamingFinal = useCallback(
+      (segmentId: string, finalText: string) => {
+        const trimmed = finalText.trim();
+        if (!trimmed) return;
+
+        const view = editorViewRef.current;
+        if (!view) return;
+
+        // 若正处于 IME 或尾部编辑中，将写入排入队列（在此期间 ephemeral sealed 文本保持显示，0 闪失！）
+        if (isComposingRef.current || isUserActivelyEditingTail(view)) {
+          pendingTranscriptsRef.current.push({ segmentId, text: trimmed });
+          schedulePendingFlushAfterIdle();
+          return;
+        }
+
+        // 正常状态：原子性写入 doc 并清除该段 ephemeral
+        const docLength = view.state.doc.length;
+        const insertText = (docLength > 0 ? '\n\n' : '') + trimmed;
+
+        view.dispatch({
+          changes: { from: docLength, insert: insertText },
+          effects: commitStreamingFinalEffect.of(segmentId),
+          annotations: Transaction.addToHistory.of(false),
+          userEvent: 'input.asr',
+        });
+
+        if (isAtBottomRef.current) {
+          instantScrollToBottom();
+        } else {
+          unreadCountRef.current += 1;
+          onUnreadCountChangeRef.current?.(unreadCountRef.current);
+        }
+      },
+      [instantScrollToBottom, isUserActivelyEditingTail, schedulePendingFlushAfterIdle]
+    );
+
+    // 兼容原有的无 segmentId 的 appendTranscript
     const appendTranscript = useCallback(
       (text: string) => {
         const trimmed = text.trim();
@@ -187,21 +424,12 @@ export const DocumentEditor = forwardRef<DocumentEditorHandle, DocumentEditorPro
         const view = editorViewRef.current;
         if (!view) return;
 
-        // 1. 若处于 IME 中文拼音输入中 -> 排队并进入调度器
-        if (isComposingRef.current) {
-          pendingTranscriptsRef.current.push(trimmed);
+        if (isComposingRef.current || isUserActivelyEditingTail(view)) {
+          pendingTranscriptsRef.current.push({ text: trimmed });
           schedulePendingFlushAfterIdle();
           return;
         }
 
-        // 2. 若用户正处于文档尾部连续打字编辑中 -> 排队并进入调度器
-        if (isUserActivelyEditingTail(view)) {
-          pendingTranscriptsRef.current.push(trimmed);
-          schedulePendingFlushAfterIdle();
-          return;
-        }
-
-        // 3. 正常状态：派发 Transaction 追加
         const docLength = view.state.doc.length;
         const insertText = (docLength > 0 ? '\n\n' : '') + trimmed;
 
@@ -212,14 +440,40 @@ export const DocumentEditor = forwardRef<DocumentEditorHandle, DocumentEditorPro
         });
 
         if (isAtBottomRef.current) {
-          scrollToBottom();
+          instantScrollToBottom();
         } else {
           unreadCountRef.current += 1;
           onUnreadCountChangeRef.current?.(unreadCountRef.current);
         }
       },
-      [scrollToBottom, isUserActivelyEditingTail, schedulePendingFlushAfterIdle]
+      [instantScrollToBottom, isUserActivelyEditingTail, schedulePendingFlushAfterIdle]
     );
+
+    // 清空指定或全部流式投影 (关键修复 P0-6: 同步清除 pendingTranscripts 中对应 segmentId，避免 Cancel 后幽灵文本再次刷入)
+    const clearStreamingPartial = useCallback((segmentId?: string) => {
+      const view = editorViewRef.current;
+      if (!view) return;
+
+      if (segmentId) {
+        pendingTranscriptsRef.current = pendingTranscriptsRef.current.filter(
+          (item) => item.segmentId !== segmentId
+        );
+        view.dispatch({ effects: commitStreamingFinalEffect.of(segmentId) });
+      } else {
+        pendingTranscriptsRef.current = [];
+        view.dispatch({ effects: clearAllStreamingEffect.of() });
+      }
+    }, []);
+
+    // 立即同步清空与提交所有待写入队列 (用于 pagehide/切后台时同步落盘)
+    const flushPendingTranscriptsNow = useCallback(() => {
+      if (tailEditTimerRef.current) {
+        clearTimeout(tailEditTimerRef.current);
+        tailEditTimerRef.current = null;
+      }
+      flushPendingTranscripts();
+      return editorViewRef.current?.state.doc.toString() || '';
+    }, [flushPendingTranscripts]);
 
     // 辅助函数：创建统一配置的 EditorState
     const createNewEditorState = useCallback((content: string) => {
@@ -231,14 +485,13 @@ export const DocumentEditor = forwardRef<DocumentEditorHandle, DocumentEditorPro
           EditorView.lineWrapping,
           placeholder('等待语音输入，或在此直接打字编辑...'),
           typoraTheme,
+          streamingTailField,
           EditorView.updateListener.of((update) => {
-            // 追踪用户真实输入行为
             const hasUserInput = update.transactions.some(
               (tr) => tr.isUserEvent('input') || tr.isUserEvent('delete')
             );
             if (hasUserInput) {
               lastUserEditAtRef.current = Date.now();
-              // 如果此时有排队的 pending transcripts，用户继续输入必须重新 reschedule 计时器
               if (pendingTranscriptsRef.current.length > 0) {
                 schedulePendingFlushAfterIdle();
               }
@@ -254,7 +507,7 @@ export const DocumentEditor = forwardRef<DocumentEditorHandle, DocumentEditorPro
       });
     }, [schedulePendingFlushAfterIdle]);
 
-    // 清空编辑器全文：彻底重置 EditorState 以抹去 Undo 历史栈，维持 Document/Segment 分层一致性
+    // 清空编辑器全文：彻底重置 EditorState
     const clearContent = useCallback(() => {
       const view = editorViewRef.current;
       if (!view) return;
@@ -267,7 +520,6 @@ export const DocumentEditor = forwardRef<DocumentEditorHandle, DocumentEditorPro
       unreadCountRef.current = 0;
       onUnreadCountChangeRef.current?.(0);
 
-      // 通过 view.setState 赋予全新空 state，彻底重置 Undo 历史栈
       const emptyState = createNewEditorState('');
       view.setState(emptyState);
 
@@ -283,11 +535,26 @@ export const DocumentEditor = forwardRef<DocumentEditorHandle, DocumentEditorPro
       ref,
       () => ({
         appendTranscript,
+        setStreamingPartial,
+        sealStreamingPartial,
+        commitStreamingFinal,
+        clearStreamingPartial,
+        flushPendingTranscriptsNow,
         clearContent,
         getContent,
         scrollToBottom,
       }),
-      [appendTranscript, clearContent, getContent, scrollToBottom]
+      [
+        appendTranscript,
+        setStreamingPartial,
+        sealStreamingPartial,
+        commitStreamingFinal,
+        clearStreamingPartial,
+        flushPendingTranscriptsNow,
+        clearContent,
+        getContent,
+        scrollToBottom,
+      ]
     );
 
     // 初始化 CodeMirror 6 (仅在 mount 时执行一次)
