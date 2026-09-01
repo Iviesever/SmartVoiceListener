@@ -103,4 +103,4 @@ Audio Pipeline (Web Audio API)
 
 ## 📄 开源许可证
 
-本项目基于 [MIT License](LICENSE) 开源。
+本项目基于 [Apache License 2.0](LICENSE) 开源。
