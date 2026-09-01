@@ -20,8 +20,8 @@ export function useVoiceListener(options?: UseVoiceListenerOptions) {
   const [vadConfig, setVadConfig] = useState<VadConfig>(DEFAULT_VAD_CONFIG);
   const [serverOnline, setServerOnline] = useState<boolean>(false);
   const [streamingReady, setStreamingReady] = useState<boolean>(false);
-  const [activeModel, setActiveModel] = useState<string>('SenseVoice');
-  const [activeModelId, setActiveModelId] = useState<string>('sensevoice-onnx');
+  const [activeModel, setActiveModel] = useState<string>('SenseVoice-Small');
+  const [activeModelId, setActiveModelId] = useState<string>('sensevoice-small');
   const [availableModels, setAvailableModels] = useState<ModelInfo[]>([]);
   const [isSwitchingModel, setIsSwitchingModel] = useState<boolean>(false);
   const [segments, setSegments] = useState<TranscriptSegment[]>(() => loadSavedSegments());

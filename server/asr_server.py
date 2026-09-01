@@ -3,6 +3,7 @@ import gc
 import io
 import json
 import os
+import re
 import sys
 import time
 import urllib.parse
@@ -42,13 +43,13 @@ except Exception:
 print(f"[*] Hardware Acceleration Status: CUDA={CUDA_AVAILABLE} (GPU: {GPU_NAME})")
 
 AVAILABLE_MODELS = {
-    "sensevoice-onnx": {
-        "id": "sensevoice-onnx",
-        "name": "SenseVoice (sherpa-onnx INT8 极速)",
-        "engine": "sherpa-onnx",
-        "type": "低延迟 / 低功耗",
-        "desc": "中文普通话/口语识别，适合分段式常驻监听；二阶段极速定稿",
-        "path": MODELS_DIR / "sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17",
+    "sensevoice-small": {
+        "id": "sensevoice-small",
+        "name": "SenseVoice-Small (FunASR 满血)",
+        "engine": "funasr",
+        "type": "高精度 / 低延迟",
+        "desc": f"SenseVoiceSmall 官方原版，GPU: {GPU_NAME if CUDA_AVAILABLE else 'CPU'}",
+        "path": EXTERNAL_MODELS_DIR / "SenseVoiceSmall",
     },
     "qwen3-asr-1.7b": {
         "id": "qwen3-asr-1.7b",
@@ -141,7 +142,7 @@ class StreamingEngine:
 
 class ModelManager:
     def __init__(self):
-        self.selected_model_id = "sensevoice-onnx"   # 用户选中的默认模型目标
+        self.selected_model_id = "sensevoice-small"   # 用户选中的默认模型目标
         self.loaded_engine_model_id = None          # 当前内存中实际装载的模型 ID
         self.current_engine = None
         self.load_engine(self.selected_model_id)
@@ -186,7 +187,23 @@ class ModelManager:
         if CUDA_AVAILABLE and torch is not None:
             torch.cuda.empty_cache()
 
-        if info["engine"] == "sherpa-onnx":
+        if info["engine"] == "funasr":
+            try:
+                from funasr import AutoModel
+            except ImportError as exc:
+                raise RuntimeError(
+                    "funasr is not installed; install it before selecting this model"
+                ) from exc
+
+            print(f"    Loading SenseVoiceSmall from: {info['path']} ...")
+            self.current_engine = AutoModel(
+                model=str(info["path"]),
+                trust_remote_code=True,
+                device="cuda:0" if CUDA_AVAILABLE else "cpu",
+                disable_update=True,
+            )
+
+        elif info["engine"] == "sherpa-onnx":
             model_file = info["path"] / "model.int8.onnx"
             if not model_file.exists():
                 model_file = info["path"] / "model.onnx"
@@ -237,6 +254,7 @@ class ModelManager:
             self.current_engine = Qwen3ASRModel.from_pretrained(
                 load_target,
                 device_map="cuda:0" if CUDA_AVAILABLE else "cpu",
+                torch_dtype=torch.bfloat16 if (CUDA_AVAILABLE and torch is not None) else torch.float32,
             )
 
         self.loaded_engine_model_id = model_id
@@ -256,6 +274,20 @@ class ModelManager:
             raise RuntimeError("No second-pass model loaded.")
 
         info = AVAILABLE_MODELS[self.loaded_engine_model_id]
+
+        if info["engine"] == "funasr":
+            res = self.current_engine.generate(
+                input=samples,
+                cache={},
+                language="auto",
+                use_itn=True,
+                batch_size_s=60,
+            )
+            if res and isinstance(res, list) and len(res) > 0:
+                raw_text = res[0].get("text", "")
+                cleaned = re.sub(r"<\|.*?\|>", "", raw_text).strip()
+                return cleaned
+            return ""
 
         if info["engine"] == "sherpa-onnx":
             stream = self.current_engine.create_stream()

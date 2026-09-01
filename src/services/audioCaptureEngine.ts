@@ -303,7 +303,7 @@ export class AudioCaptureEngine {
   private hasReceivedPartialForActiveSegment = false;
 
   // 当前用户选择的模型与当前段冻结的模型 (P1-1: Production Model Freeze)
-  public activeModelId = 'sensevoice-onnx';
+  public activeModelId = 'sensevoice-small';
   private activeSegmentModelId: string | null = null;
 
   // 自适应动态底噪基线
@@ -331,7 +331,7 @@ export class AudioCaptureEngine {
   public onError?: (event: ServerErrorEvent) => void;
   public onConnectionChange?: (connected: boolean) => void;
 
-  constructor(config: VadConfig = DEFAULT_VAD_CONFIG, modelId = 'sensevoice-onnx') {
+  constructor(config: VadConfig = DEFAULT_VAD_CONFIG, modelId = 'sensevoice-small') {
     this.config = { ...config };
     this.activeModelId = modelId;
     this.transport = new StreamingTransport();

@@ -69,7 +69,7 @@ describe('AudioCaptureEngine Settlement & Lifecycle (Real TypeScript)', () => {
       durationMs: 1000,
       startedAt: 1000,
       endedAt: 2000,
-      modelId: 'sensevoice-onnx',
+      modelId: 'sensevoice-small',
     });
 
     expect(engine.localSegmentCache.has(segId)).toBe(true);
@@ -78,7 +78,7 @@ describe('AudioCaptureEngine Settlement & Lifecycle (Real TypeScript)', () => {
     const claim1 = engine.claimSegmentForFinal(segId);
     expect(claim1).toBeDefined();
     expect(claim1?.durationMs).toBe(1000);
-    expect(claim1?.modelId).toBe('sensevoice-onnx');
+    expect(claim1?.modelId).toBe('sensevoice-small');
     expect(engine.localSegmentCache.has(segId)).toBe(false);
     expect((engine as any).segmentTimers.has(segId)).toBe(false);
 
@@ -162,7 +162,7 @@ describe('AudioCaptureEngine Settlement & Lifecycle (Real TypeScript)', () => {
     );
 
     // If user switches activeModelId during speech
-    engine.activeModelId = 'sensevoice-onnx';
+    engine.activeModelId = 'sensevoice-small';
 
     // When finalized, the segment should still preserve the frozen 'qwen3-asr-1.7b'
     (engine as any).finalizeSpeechSegment();

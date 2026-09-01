@@ -77,9 +77,9 @@ async def test_scheduler_model_isolation_and_rollback():
     samples, sample_rate = load_test_audio()
 
     # 1. 用户初始选定并加载 SenseVoice
-    model_manager.selected_model_id = "sensevoice-onnx"
-    await asyncio.to_thread(model_manager.load_engine, "sensevoice-onnx")
-    assert model_manager.loaded_engine_model_id == "sensevoice-onnx"
+    model_manager.selected_model_id = "sensevoice-small"
+    await asyncio.to_thread(model_manager.load_engine, "sensevoice-small")
+    assert model_manager.loaded_engine_model_id == "sensevoice-small"
     assert model_manager.current_engine is not None
 
     # 2. 模拟注册一个存在但加载过程中一定会抛出异常的坏模型
@@ -91,24 +91,24 @@ async def test_scheduler_model_isolation_and_rollback():
     }
 
     client = TestClient(app)
-    # 请求切换到坏模型：应该触发内部加载异常并自动回滚到 sensevoice-onnx
+    # 请求切换到坏模型：应该触发内部加载异常并自动回滚到 sensevoice-small
     res = client.post("/api/switch_model", json={"modelId": "faulty-test-model"})
     assert res.status_code == 500
     print("  [✓] /api/switch_model correctly returned 500 for faulty model")
 
-    # 3. 核心验证：用户目标与实际 loaded engine 均已成功回滚到 sensevoice-onnx，引擎没有死锁或为 None
-    assert model_manager.selected_model_id == "sensevoice-onnx"
-    assert model_manager.loaded_engine_model_id == "sensevoice-onnx"
+    # 3. 核心验证：用户目标与实际 loaded engine 均已成功回滚到 sensevoice-small，引擎没有死锁或为 None
+    assert model_manager.selected_model_id == "sensevoice-small"
+    assert model_manager.loaded_engine_model_id == "sensevoice-small"
     assert model_manager.current_engine is not None
 
     # 4. 执行推理验证回滚后的引擎依然 100% 正常工作
     job = FinalJob(
         session_epoch=1,
         segment_id="seg-rollback-test",
-        model_id="sensevoice-onnx",
+        model_id="sensevoice-small",
         samples=samples[:16000],
         sample_rate=sample_rate,
-        fallback_text="fallback"
+        fallback_text="回滚测试"
     )
     result = await inference_scheduler.execute_job(job)
     assert result.final_source == "second_pass"
@@ -148,7 +148,7 @@ def test_websocket_stream_e2e():
             "sessionEpoch": 1,
             "segmentId": seg_a,
             "hasPrefix": True,
-            "modelId": "sensevoice-onnx"
+            "modelId": "sensevoice-small"
         })
 
         # 3. 连续推流 PCM

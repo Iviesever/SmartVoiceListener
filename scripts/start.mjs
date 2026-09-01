@@ -35,21 +35,22 @@ if (!existsSync(nodeModulesPath)) {
   console.log(green('[成功] 前端依赖安装完成！\n'));
 }
 
-// 2. 检查模型文件完整性 (流式 Paraformer 与定稿 SenseVoice 均为系统启动必要底座)
+// 2. 检查模型文件完整性 (流式 Paraformer 与本地 SenseVoiceSmall 均为系统启动底座)
 const modelsDir = resolve(rootDir, 'models');
-const sensevoiceDir = resolve(modelsDir, 'sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17');
-const sensevoiceModel = existsSync(resolve(sensevoiceDir, 'model.int8.onnx')) || existsSync(resolve(sensevoiceDir, 'model.onnx'));
-const sensevoiceTokens = existsSync(resolve(sensevoiceDir, 'tokens.txt'));
-const senseVoiceReady = sensevoiceModel && sensevoiceTokens;
-
 const paraformerDir = resolve(modelsDir, 'sherpa-onnx-streaming-paraformer-bilingual-zh-en');
 const paraformerEncoder = existsSync(resolve(paraformerDir, 'encoder.int8.onnx'));
 const paraformerDecoder = existsSync(resolve(paraformerDir, 'decoder.int8.onnx'));
 const paraformerTokens = existsSync(resolve(paraformerDir, 'tokens.txt'));
 const streamingReady = paraformerEncoder && paraformerDecoder && paraformerTokens;
 
-if (!senseVoiceReady || !streamingReady) {
-  console.log(yellow('[提示] 检测到模型文件不完整，正在自动补全/拉取模型...'));
+const localSenseVoiceDir = 'D:\\resource\\AI_WorkSpace\\Models\\SenseVoiceSmall';
+const localSenseVoiceReady =
+  existsSync(localSenseVoiceDir) &&
+  existsSync(resolve(localSenseVoiceDir, 'model.pt')) &&
+  existsSync(resolve(localSenseVoiceDir, 'config.yaml'));
+
+if (!streamingReady) {
+  console.log(yellow('[提示] 检测到流式 Paraformer 模型不完整，正在自动补全/拉取模型...'));
   const pyCmd = isWin ? 'python' : 'python3';
   const dlRes = spawnSync(pyCmd, ['download_models.py'], { cwd: rootDir, stdio: 'inherit' });
   if (dlRes.status !== 0) {
@@ -58,16 +59,18 @@ if (!senseVoiceReady || !streamingReady) {
   }
 }
 
-const sensevoiceModelAfter = existsSync(resolve(sensevoiceDir, 'model.int8.onnx')) || existsSync(resolve(sensevoiceDir, 'model.onnx'));
-const sensevoiceTokensAfter = existsSync(resolve(sensevoiceDir, 'tokens.txt'));
 const paraformerReadyAfter =
   existsSync(resolve(paraformerDir, 'encoder.int8.onnx')) &&
   existsSync(resolve(paraformerDir, 'decoder.int8.onnx')) &&
   existsSync(resolve(paraformerDir, 'tokens.txt'));
 
-if (!sensevoiceModelAfter || !sensevoiceTokensAfter || !paraformerReadyAfter) {
-  console.log(red('\n[错误] 基础语音模型（SenseVoice / Streaming Paraformer）不完整，服务无法启动！'));
+if (!paraformerReadyAfter) {
+  console.log(red('\n[错误] Streaming Paraformer 模型缺失，流式服务无法启动！'));
   process.exit(1);
+}
+
+if (!localSenseVoiceReady) {
+  console.log(yellow(`\n[警告] 本地 SenseVoiceSmall 未在 ${localSenseVoiceDir} 找到，可能影响该模型定稿。`));
 }
 console.log(green('[✓] 核心流式与定稿模型全部就绪！\n'));
 

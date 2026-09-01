@@ -23,32 +23,20 @@ def download_file(url, target_path):
     urllib.request.urlretrieve(url, target_path, reporthook)
     sys.stdout.write("\n")
 
-# 1. 下载 SenseVoice ONNX 模型包 (model.int8.onnx + tokens.txt)
-sensevoice_dir = MODELS_DIR / "sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17"
-sensevoice_model_file = sensevoice_dir / "model.int8.onnx"
-sensevoice_tokens_file = sensevoice_dir / "tokens.txt"
+# 1. 检查本地原版 SenseVoiceSmall (D:\resource\AI_WorkSpace\Models\SenseVoiceSmall)
+local_sensevoice_dir = Path(r"D:\resource\AI_WorkSpace\Models\SenseVoiceSmall")
+local_sensevoice_ok = (
+    local_sensevoice_dir.exists()
+    and (local_sensevoice_dir / "model.pt").exists()
+    and (local_sensevoice_dir / "config.yaml").exists()
+)
 
-if not (sensevoice_model_file.exists() and sensevoice_tokens_file.exists()):
-    tar_path = MODELS_DIR / "sense-voice.tar.bz2"
-    sensevoice_urls = [
-        "https://ghproxy.net/https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17.tar.bz2",
-        "https://hf-mirror.com/csukuangfj/sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17/resolve/main/sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17.tar.bz2",
-        "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17.tar.bz2"
-    ]
-    for u in sensevoice_urls:
-        try:
-            download_file(u, tar_path)
-            print("[*] Extracting SenseVoice archive...")
-            with tarfile.open(tar_path, "r:bz2") as tar:
-                tar.extractall(path=MODELS_DIR)
-            if tar_path.exists():
-                tar_path.unlink()
-            print("[✓] SenseVoice extracted successfully!")
-            break
-        except Exception as e:
-            print(f"[-] Failed with {u}: {e}")
+if not local_sensevoice_ok:
+    print(f"[-] Warning: Local SenseVoiceSmall not found at {local_sensevoice_dir}")
+else:
+    print(f"[✓] Local SenseVoiceSmall found at {local_sensevoice_dir}")
 
-# 2. 下载 Streaming Paraformer INT8 模型 (用于 First-Pass 实时流式识别)
+# 2. 下载 Streaming Paraformer INT8 模型 (用于 First-Pass 实时流式增量识别)
 paraformer_dir = MODELS_DIR / "sherpa-onnx-streaming-paraformer-bilingual-zh-en"
 paraformer_encoder = paraformer_dir / "encoder.int8.onnx"
 paraformer_decoder = paraformer_dir / "decoder.int8.onnx"
@@ -89,11 +77,10 @@ for item in MODELS_DIR.rglob("*"):
     if item.is_file():
         print(f" - {item.relative_to(MODELS_DIR)} ({item.stat().st_size / (1024*1024):.2f} MB)")
 
-sensevoice_ok = sensevoice_model_file.exists() and sensevoice_tokens_file.exists()
 paraformer_ok = paraformer_encoder.exists() and paraformer_decoder.exists() and paraformer_tokens.exists()
 
-if not (sensevoice_ok and paraformer_ok):
-    print("[!] ERROR: Model files are incomplete (SenseVoice or Paraformer missing)!", file=sys.stderr)
+if not paraformer_ok:
+    print("[!] ERROR: Streaming Paraformer model files are incomplete!", file=sys.stderr)
     sys.exit(1)
 
 sys.exit(0)
