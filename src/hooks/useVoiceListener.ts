@@ -20,9 +20,12 @@ export function useVoiceListener(options?: UseVoiceListenerOptions) {
   const [isSwitchingModel, setIsSwitchingModel] = useState<boolean>(false);
   const [segments, setSegments] = useState<TranscriptSegment[]>(() => loadSavedSegments());
 
-  // 关键：全局会话世代 (Session Epoch)，在清空、停止、新开启时递增，彻底封死并发竞态
+  // 全局会话世代 (Session Epoch)，在清空、停止、新开启时递增
   const sessionEpochRef = useRef<number>(1);
   const currentSpeechEpochRef = useRef<number>(1);
+  // 并发 ASR 飞行中任务计数器，用于精确控制状态机切换
+  const inFlightAsrCountRef = useRef<number>(0);
+
   const engineRef = useRef<VadEngine | null>(null);
   const segmentsRef = useRef<TranscriptSegment[]>(segments);
   segmentsRef.current = segments;
@@ -62,9 +65,10 @@ export function useVoiceListener(options?: UseVoiceListenerOptions) {
     return () => clearTimeout(timer);
   }, [segments]);
 
-  // 页面卸载时释放所有未释放的 Blob URL 以及麦克风
+  // 页面卸载时安全清理：先递增 epoch 阻断飞出的 ASR 请求，再清理麦克风与所有 Blob URL
   useEffect(() => {
     return () => {
+      sessionEpochRef.current += 1;
       engineRef.current?.stop();
       engineRef.current = null;
       segmentsRef.current.forEach((s) => {
@@ -100,6 +104,7 @@ export function useVoiceListener(options?: UseVoiceListenerOptions) {
       return;
     }
 
+    inFlightAsrCountRef.current += 1;
     setState('TRANSCRIBING');
     setPauseCountdown(0);
 
@@ -107,7 +112,6 @@ export function useVoiceListener(options?: UseVoiceListenerOptions) {
     const startedAt = now - durationMs;
     const endedAt = now;
     const wavBlob = pcmToWavBlob(pcmData, vadConfig.sampleRate);
-    const audioUrl = URL.createObjectURL(wavBlob);
 
     try {
       const res = await transcribeAudioBlob(wavBlob);
@@ -115,17 +119,18 @@ export function useVoiceListener(options?: UseVoiceListenerOptions) {
       // 竞态校验：比对 speechEpoch 是否等于当前的 sessionEpochRef
       if (speechEpoch !== sessionEpochRef.current) {
         console.log('[ASR] Discarding stale transcript due to epoch mismatch:', res.text);
-        URL.revokeObjectURL(audioUrl);
         return;
       }
 
-      if (res.text) {
+      // 关键修复：只有在确实有识别文本且成功入库时才按需创建 Object URL，避免空识别结果泄漏
+      if (res.text && res.text.trim()) {
+        const audioUrl = URL.createObjectURL(wavBlob);
         const segment: TranscriptSegment = {
           id: `seg-${Date.now()}-${Math.random().toString(36).substring(2, 7)}`,
           generation: speechEpoch,
           startedAt,
           endedAt,
-          originalText: res.text, // 原始 ASR 证据不可变
+          originalText: res.text.trim(),
           modelId: res.modelId || activeModelId,
           durationMs,
           audioBlobUrl: audioUrl,
@@ -133,14 +138,14 @@ export function useVoiceListener(options?: UseVoiceListenerOptions) {
         };
 
         setSegments((prev) => [...prev, segment]);
-        optionsRef.current?.onTranscriptFinal?.(res.text, segment);
+        optionsRef.current?.onTranscriptFinal?.(res.text.trim(), segment);
       }
     } catch (err: unknown) {
       console.error('ASR transcription failed:', err);
-      URL.revokeObjectURL(audioUrl);
     } finally {
-      // 关键保护：只有当前仍是同一 session 且引擎仍在运行时才切换为 LISTENING_SILENCE
-      if (speechEpoch === sessionEpochRef.current && engineRef.current) {
+      inFlightAsrCountRef.current = Math.max(0, inFlightAsrCountRef.current - 1);
+      // 关键保护：只有当前仍是同一 session、引擎仍在运行且所有并发请求均已完成时才切回 LISTENING_SILENCE
+      if (speechEpoch === sessionEpochRef.current && engineRef.current && inFlightAsrCountRef.current === 0) {
         setState((current) => (current === 'TRANSCRIBING' ? 'LISTENING_SILENCE' : current));
       }
     }
@@ -155,6 +160,7 @@ export function useVoiceListener(options?: UseVoiceListenerOptions) {
 
       // 开启新会话时更新 session epoch
       sessionEpochRef.current += 1;
+      inFlightAsrCountRef.current = 0;
       const currentSession = sessionEpochRef.current;
 
       const engine = new VadEngine(vadConfig);
@@ -194,6 +200,7 @@ export function useVoiceListener(options?: UseVoiceListenerOptions) {
   // 停止监听
   const stopListening = useCallback(() => {
     sessionEpochRef.current += 1; // 终止当前所有 in-flight 任务的合法性
+    inFlightAsrCountRef.current = 0;
     if (engineRef.current) {
       engineRef.current.stop();
       engineRef.current = null;
@@ -215,6 +222,7 @@ export function useVoiceListener(options?: UseVoiceListenerOptions) {
   // 清空文档与后台 Segments
   const resetWorkspace = useCallback(() => {
     sessionEpochRef.current += 1; // 递增世代，彻底废弃已在队列或飞行中的所有请求
+    inFlightAsrCountRef.current = 0;
     setSegments((prev) => {
       prev.forEach((s) => {
         if (s.audioBlobUrl?.startsWith('blob:')) {

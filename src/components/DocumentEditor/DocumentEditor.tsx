@@ -107,7 +107,7 @@ export const DocumentEditor = forwardRef<DocumentEditorHandle, DocumentEditorPro
       onUnreadCountChangeRef.current?.(0);
     }, []);
 
-    // 消费 pendingTranscripts 队列
+    // 实际执行队列消费与追加写入
     const flushPendingTranscripts = useCallback(() => {
       if (pendingTranscriptsRef.current.length === 0) return;
       const view = editorViewRef.current;
@@ -120,7 +120,7 @@ export const DocumentEditor = forwardRef<DocumentEditorHandle, DocumentEditorPro
         const docLength = view.state.doc.length;
         const insertText = (docLength > 0 ? '\n\n' : '') + text;
 
-        // 关键：ASR 自动追加不进入用户的 Undo 历史栈 (addToHistory: false)
+        // ASR 自动追加不进入用户 Undo 栈
         view.dispatch({
           changes: { from: docLength, insert: insertText },
           annotations: Transaction.addToHistory.of(false),
@@ -136,13 +136,43 @@ export const DocumentEditor = forwardRef<DocumentEditorHandle, DocumentEditorPro
       }
     }, [scrollToBottom]);
 
-    // 判断用户是否正在文档尾部活跃打字（非 IME 状态下的普通连续敲击）
+    // 关键修复：统一的真实 Idle 调度器（必须距离用户最后一次输入 >= 800ms 才允许 flush）
+    const schedulePendingFlushAfterIdle = useCallback(() => {
+      if (tailEditTimerRef.current) {
+        clearTimeout(tailEditTimerRef.current);
+        tailEditTimerRef.current = null;
+      }
+
+      if (pendingTranscriptsRef.current.length === 0) return;
+
+      const tryFlush = () => {
+        // 1. 若仍处于输入法 composition 状态，继续等待
+        if (isComposingRef.current) {
+          tailEditTimerRef.current = setTimeout(tryFlush, 200);
+          return;
+        }
+
+        // 2. 严格校验距离最后一次用户真实打字是否满 800ms
+        const elapsed = Date.now() - lastUserEditAtRef.current;
+        if (elapsed < 800) {
+          tailEditTimerRef.current = setTimeout(tryFlush, 800 - elapsed);
+          return;
+        }
+
+        // 3. 用户确实已闲置 800ms，安全出队写入
+        flushPendingTranscripts();
+      };
+
+      tailEditTimerRef.current = setTimeout(tryFlush, 800);
+    }, [flushPendingTranscripts]);
+
+    // 判断用户是否正在文档尾部活跃打字
     const isUserActivelyEditingTail = useCallback((view: EditorView): boolean => {
       if (!view.hasFocus) return false;
       const docLength = view.state.doc.length;
       const selectionHead = view.state.selection.main.head;
       const isNearTail = selectionHead >= docLength - 2;
-      const isRecentEdit = Date.now() - lastUserEditAtRef.current < 800; // 800ms 防打扰窗口
+      const isRecentEdit = Date.now() - lastUserEditAtRef.current < 800;
       return isNearTail && isRecentEdit;
     }, []);
 
@@ -155,23 +185,21 @@ export const DocumentEditor = forwardRef<DocumentEditorHandle, DocumentEditorPro
         const view = editorViewRef.current;
         if (!view) return;
 
-        // 1. 若处于 IME 中文拼音输入中 -> 安全排队
+        // 1. 若处于 IME 中文拼音输入中 -> 排队并进入调度器
         if (isComposingRef.current) {
           pendingTranscriptsRef.current.push(trimmed);
+          schedulePendingFlushAfterIdle();
           return;
         }
 
-        // 2. 若用户正处于文档尾部连续打字编辑中 -> 安全排队并延迟 flush
+        // 2. 若用户正处于文档尾部连续打字编辑中 -> 排队并进入调度器
         if (isUserActivelyEditingTail(view)) {
           pendingTranscriptsRef.current.push(trimmed);
-          if (tailEditTimerRef.current) clearTimeout(tailEditTimerRef.current);
-          tailEditTimerRef.current = setTimeout(() => {
-            flushPendingTranscripts();
-          }, 800);
+          schedulePendingFlushAfterIdle();
           return;
         }
 
-        // 3. 正常状态：派发 Transaction，并在末尾追加（不抢占 Undo 栈）
+        // 3. 正常状态：派发 Transaction 追加
         const docLength = view.state.doc.length;
         const insertText = (docLength > 0 ? '\n\n' : '') + trimmed;
 
@@ -188,10 +216,43 @@ export const DocumentEditor = forwardRef<DocumentEditorHandle, DocumentEditorPro
           onUnreadCountChangeRef.current?.(unreadCountRef.current);
         }
       },
-      [scrollToBottom, isUserActivelyEditingTail, flushPendingTranscripts]
+      [scrollToBottom, isUserActivelyEditingTail, schedulePendingFlushAfterIdle]
     );
 
-    // 清空编辑器全文
+    // 辅助函数：创建统一配置的 EditorState
+    const createNewEditorState = useCallback((content: string) => {
+      return EditorState.create({
+        doc: content,
+        extensions: [
+          history(),
+          keymap.of([...defaultKeymap, ...historyKeymap]),
+          EditorView.lineWrapping,
+          placeholder('等待语音输入，或在此直接打字编辑...'),
+          typoraTheme,
+          EditorView.updateListener.of((update) => {
+            // 追踪用户真实输入行为
+            const hasUserInput = update.transactions.some(
+              (tr) => tr.isUserEvent('input') || tr.isUserEvent('delete')
+            );
+            if (hasUserInput) {
+              lastUserEditAtRef.current = Date.now();
+              // 如果此时有排队的 pending transcripts，用户继续输入必须重新 reschedule 计时器
+              if (pendingTranscriptsRef.current.length > 0) {
+                schedulePendingFlushAfterIdle();
+              }
+            }
+
+            if (update.docChanged) {
+              const str = update.state.doc.toString();
+              const strictCount = str.replace(/\s/g, '').length;
+              onDocChangeRef.current?.(str, strictCount);
+            }
+          }),
+        ],
+      });
+    }, [schedulePendingFlushAfterIdle]);
+
+    // 清空编辑器全文：彻底重置 EditorState 以抹去 Undo 历史栈，维持 Document/Segment 分层一致性
     const clearContent = useCallback(() => {
       const view = editorViewRef.current;
       if (!view) return;
@@ -204,12 +265,12 @@ export const DocumentEditor = forwardRef<DocumentEditorHandle, DocumentEditorPro
       unreadCountRef.current = 0;
       onUnreadCountChangeRef.current?.(0);
 
-      view.dispatch({
-        changes: { from: 0, to: view.state.doc.length, insert: '' },
-        userEvent: 'delete.all',
-      });
+      // 关键：通过 view.setState 赋予全新空 state，彻底重置 Undo 历史栈
+      const emptyState = createNewEditorState('');
+      view.setState(emptyState);
+
       isAtBottomRef.current = true;
-    }, []);
+    }, [createNewEditorState]);
 
     // 获取全文内容
     const getContent = useCallback(() => {
@@ -231,33 +292,7 @@ export const DocumentEditor = forwardRef<DocumentEditorHandle, DocumentEditorPro
     useEffect(() => {
       if (!editorContainerRef.current) return;
 
-      const startState = EditorState.create({
-        doc: initialContent,
-        extensions: [
-          history(),
-          keymap.of([...defaultKeymap, ...historyKeymap]),
-          EditorView.lineWrapping,
-          placeholder('等待语音输入，或在此直接打字编辑...'),
-          typoraTheme,
-          EditorView.updateListener.of((update) => {
-            // 追踪用户真实输入行为时间戳
-            const hasUserInput = update.transactions.some(
-              (tr) => tr.isUserEvent('input') || tr.isUserEvent('delete')
-            );
-            if (hasUserInput) {
-              lastUserEditAtRef.current = Date.now();
-            }
-
-            if (update.docChanged) {
-              const str = update.state.doc.toString();
-              // 严格纯文字统计（过滤纯空白符）
-              const strictCount = str.replace(/\s/g, '').length;
-              onDocChangeRef.current?.(str, strictCount);
-            }
-          }),
-        ],
-      });
-
+      const startState = createNewEditorState(initialContent);
       const view = new EditorView({
         state: startState,
         parent: editorContainerRef.current,
@@ -265,7 +300,6 @@ export const DocumentEditor = forwardRef<DocumentEditorHandle, DocumentEditorPro
 
       editorViewRef.current = view;
 
-      // 触发初始字数通知
       if (initialContent) {
         const strictCount = initialContent.replace(/\s/g, '').length;
         onDocChangeRef.current?.(initialContent, strictCount);
@@ -293,9 +327,8 @@ export const DocumentEditor = forwardRef<DocumentEditorHandle, DocumentEditorPro
 
       const handleCompositionEnd = () => {
         isComposingRef.current = false;
-        queueMicrotask(() => {
-          flushPendingTranscripts();
-        });
+        // 关键：composition 结束后同样走统一的 Idle 调度器，绝不立刻抢写
+        schedulePendingFlushAfterIdle();
       };
 
       view.contentDOM.addEventListener('compositionstart', handleCompositionStart);
@@ -312,7 +345,7 @@ export const DocumentEditor = forwardRef<DocumentEditorHandle, DocumentEditorPro
         view.destroy();
         editorViewRef.current = null;
       };
-    }, [initialContent, flushPendingTranscripts]);
+    }, [initialContent, createNewEditorState, schedulePendingFlushAfterIdle]);
 
     return (
       <div className="document-workspace">
