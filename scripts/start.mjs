@@ -48,7 +48,13 @@ const paraformerDecoder = existsSync(resolve(paraformerDir, 'decoder.int8.onnx')
 const paraformerTokens = existsSync(resolve(paraformerDir, 'tokens.txt'));
 const streamingReady = paraformerEncoder && paraformerDecoder && paraformerTokens;
 
-if (!senseVoiceReady || !streamingReady) {
+const skipStreamingDownload =
+  process.env.SMARTVOICE_SKIP_STREAMING_MODEL_DOWNLOAD === '1' ||
+  existsSync(resolve(modelsDir, '.skip_streaming_download'));
+
+const shouldDownload = !senseVoiceReady || (!streamingReady && !skipStreamingDownload);
+
+if (shouldDownload) {
   console.log(yellow('[提示] 检测到模型文件不完整，正在尝试自动补全/拉取模型...'));
   const pyCmd = isWin ? 'python' : 'python3';
   const dlRes = spawnSync(pyCmd, ['download_models.py'], { cwd: rootDir, stdio: 'inherit' });
