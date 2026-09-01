@@ -1,12 +1,12 @@
 import { VadConfig } from '../types';
 
 export const DEFAULT_VAD_CONFIG: VadConfig = {
-  speechThreshold: 0.02,     // 初始灵敏度（更灵敏）
-  silenceThreshold: 0.012,   // 静音门限
-  pauseDurationMs: 1500,     // 停顿 1.5 秒（更自然，领导思考短暂停顿不切断）
-  prefixBufferMs: 800,       // 往前追溯保留 0.8 秒音频（彻底杜绝吞首字）
-  maxSpeechDurationMs: 90000,// 单段最大 90 秒
-  sampleRate: 16000,         // 16kHz 单声道 PCM
+  speechThreshold: 0.02,      // 初始灵敏度（更灵敏）
+  silenceThreshold: 0.012,    // 静音门限
+  pauseDurationMs: 1500,      // 停顿 1.5 秒（更自然，短暂停顿不切断）
+  prefixBufferMs: 800,        // 往前追溯保留 0.8 秒音频，减少吞首字
+  maxSpeechDurationMs: 90000, // 单段最大 90 秒
+  sampleRate: 16000,          // 16kHz 单声道 PCM
 };
 
 export class VadEngine {
@@ -17,22 +17,23 @@ export class VadEngine {
   private analyser: AnalyserNode | null = null;
 
   // 自适应动态底噪基线
-  private noiseFloor: number = 0.005;
-  private noiseFloorWeight: number = 0.05;
+  private noiseFloor = 0.005;
+  private readonly noiseFloorWeight = 0.05;
 
-  // 环形前缀缓冲区（保存开口前 0.8s 音频）
+  // 环形前缀缓冲区
   private prefixBuffer: Float32Array[] = [];
-  private maxPrefixChunks: number = 0;
+  private maxPrefixChunks = 0;
+  private readonly bufferSize = 2048;
 
   // 连续帧能量平滑检测
-  private consecutiveSpeechFrames: number = 0;
-  private consecutiveSilenceFrames: number = 0;
+  private consecutiveSpeechFrames = 0;
+  private consecutiveSilenceFrames = 0;
 
   // 当前说话段累积音频
   private speechChunks: Float32Array[] = [];
-  private isSpeaking: boolean = false;
-  private silenceStartMs: number = 0;
-  private speechStartMs: number = 0;
+  private isSpeaking = false;
+  private silenceStartMs = 0;
+  private speechStartMs = 0;
 
   // 回调事件
   public onSpeakingStart?: () => void;
@@ -42,10 +43,23 @@ export class VadEngine {
 
   constructor(config: VadConfig = DEFAULT_VAD_CONFIG) {
     this.config = { ...config };
+    this.recalculatePrefixCapacity();
+  }
+
+  private recalculatePrefixCapacity() {
+    this.maxPrefixChunks = Math.max(
+      1,
+      Math.ceil((this.config.prefixBufferMs / 1000) * (this.config.sampleRate / this.bufferSize)),
+    );
+
+    if (this.prefixBuffer.length > this.maxPrefixChunks) {
+      this.prefixBuffer = this.prefixBuffer.slice(-this.maxPrefixChunks);
+    }
   }
 
   public updateConfig(newConfig: Partial<VadConfig>) {
     this.config = { ...this.config, ...newConfig };
+    this.recalculatePrefixCapacity();
   }
 
   public async start(): Promise<void> {
@@ -60,13 +74,14 @@ export class VadEngine {
     });
 
     this.mediaStream = stream;
-    this.audioContext = new (window.AudioContext || (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext)({
-      sampleRate: this.config.sampleRate,
-    });
+    this.audioContext = new (
+      window.AudioContext ||
+      (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext
+    )({ sampleRate: this.config.sampleRate });
 
     const source = this.audioContext.createMediaStreamSource(stream);
-    
-    // 增加硬件级带通滤波 (80Hz ~ 7500Hz)，专门滤除电流低频隆隆声和高频刺耳噪音
+
+    // 语音频段预滤波：削弱低频隆隆声与超出 16kHz 语音带宽的高频噪声
     const highpass = this.audioContext.createBiquadFilter();
     highpass.type = 'highpass';
     highpass.frequency.value = 80;
@@ -78,11 +93,9 @@ export class VadEngine {
     this.analyser = this.audioContext.createAnalyser();
     this.analyser.fftSize = 512;
 
-    const bufferSize = 2048;
-    this.scriptProcessor = this.audioContext.createScriptProcessor(bufferSize, 1, 1);
-
-    // 0.8s 环形缓冲区对应分块数
-    this.maxPrefixChunks = Math.max(4, Math.round((this.config.prefixBufferMs / 1000) * (this.config.sampleRate / bufferSize)));
+    // TODO: 正式桌面版本迁移到 AudioWorklet；当前保留 ScriptProcessor 以维持 MVP 兼容性。
+    this.scriptProcessor = this.audioContext.createScriptProcessor(this.bufferSize, 1, 1);
+    this.recalculatePrefixCapacity();
 
     this.scriptProcessor.onaudioprocess = (e) => {
       const inputData = e.inputBuffer.getChannelData(0);
@@ -97,39 +110,37 @@ export class VadEngine {
   }
 
   private processAudioFrame(chunk: Float32Array) {
-    // 1. 计算当前音频帧的 RMS 能量与峰值
+    // 1. 计算当前音频帧 RMS 能量
     let sum = 0;
-    let peak = 0;
     for (let i = 0; i < chunk.length; i++) {
-      const abs = Math.abs(chunk[i]);
-      if (abs > peak) peak = abs;
       sum += chunk[i] * chunk[i];
     }
     const rms = Math.sqrt(sum / chunk.length);
-
     const now = Date.now();
 
     // 2. 动态自适应底噪学习算法
-    if (!this.isSpeaking) {
-      if (rms < this.config.speechThreshold * 1.2) {
-        this.noiseFloor = this.noiseFloor * (1 - this.noiseFloorWeight) + rms * this.noiseFloorWeight;
-      }
+    if (!this.isSpeaking && rms < this.config.speechThreshold * 1.2) {
+      this.noiseFloor =
+        this.noiseFloor * (1 - this.noiseFloorWeight) + rms * this.noiseFloorWeight;
     }
 
-    // 动态起动门限：自适应基线 + 设定阈值
-    const dynamicThreshold = Math.max(this.config.speechThreshold, this.noiseFloor * 2.2 + 0.008);
+    // 动态起动门限：自适应基线 + 用户设置的最低门限
+    const dynamicThreshold = Math.max(
+      this.config.speechThreshold,
+      this.noiseFloor * 2.2 + 0.008,
+    );
     const isSpeechFrame = rms >= dynamicThreshold;
 
     this.onVolumeUpdate?.(rms, this.isSpeaking, this.noiseFloor);
 
     if (!this.isSpeaking) {
-      // 维护前缀环形缓冲
+      // 维护前缀环形缓冲。当前 chunk 已经进入 prefixBuffer，确认开口时不能再重复追加。
       this.prefixBuffer.push(chunk);
       if (this.prefixBuffer.length > this.maxPrefixChunks) {
         this.prefixBuffer.shift();
       }
 
-      // 连续 2 帧检测到人声能量 ➔ 确认开口，防止偶发杂音触发
+      // 连续 2 帧检测到人声能量后确认开口，减少偶发杂音触发。
       if (isSpeechFrame) {
         this.consecutiveSpeechFrames++;
         if (this.consecutiveSpeechFrames >= 2) {
@@ -138,38 +149,45 @@ export class VadEngine {
           this.silenceStartMs = 0;
           this.consecutiveSpeechFrames = 0;
           this.consecutiveSilenceFrames = 0;
-          // 将前缀环形缓冲（0.8s 前）与当前帧完全拼接
-          this.speechChunks = [...this.prefixBuffer, chunk];
+
+          // prefixBuffer 已包含当前触发帧，直接复制即可，避免约 128ms 音频重复。
+          this.speechChunks = [...this.prefixBuffer];
           this.prefixBuffer = [];
           this.onSpeakingStart?.();
         }
       } else {
         this.consecutiveSpeechFrames = 0;
       }
-    } else {
-      // 正在说话中
-      this.speechChunks.push(chunk);
+      return;
+    }
 
-      if (rms >= this.config.silenceThreshold) {
-        this.silenceStartMs = 0;
-        this.consecutiveSilenceFrames = 0;
-      } else {
-        this.consecutiveSilenceFrames++;
-        // 连续若干帧低于门限开始计算静音时间
-        if (this.silenceStartMs === 0 && this.consecutiveSilenceFrames >= 2) {
-          this.silenceStartMs = now;
-        }
+    // 正在说话中
+    this.speechChunks.push(chunk);
 
-        if (this.silenceStartMs > 0) {
-          const elapsedSilence = now - this.silenceStartMs;
-          const remainingMs = Math.max(0, this.config.pauseDurationMs - elapsedSilence);
-          this.onSpeakingPause?.(remainingMs);
+    // 单段上限必须与静音判断解耦：即使连续讲话没有任何静音，也要按时强制切段。
+    if (now - this.speechStartMs >= this.config.maxSpeechDurationMs) {
+      this.finalizeSpeechSegment();
+      return;
+    }
 
-          const totalDuration = now - this.speechStartMs;
-          if (elapsedSilence >= this.config.pauseDurationMs || totalDuration >= this.config.maxSpeechDurationMs) {
-            this.finalizeSpeechSegment();
-          }
-        }
+    if (rms >= this.config.silenceThreshold) {
+      this.silenceStartMs = 0;
+      this.consecutiveSilenceFrames = 0;
+      return;
+    }
+
+    this.consecutiveSilenceFrames++;
+    if (this.silenceStartMs === 0 && this.consecutiveSilenceFrames >= 2) {
+      this.silenceStartMs = now;
+    }
+
+    if (this.silenceStartMs > 0) {
+      const elapsedSilence = now - this.silenceStartMs;
+      const remainingMs = Math.max(0, this.config.pauseDurationMs - elapsedSilence);
+      this.onSpeakingPause?.(remainingMs);
+
+      if (elapsedSilence >= this.config.pauseDurationMs) {
+        this.finalizeSpeechSegment();
       }
     }
   }
@@ -192,7 +210,7 @@ export class VadEngine {
       offset += c.length;
     }
 
-    // 音频响度峰值归一化 (Peak Normalization)，将人声放大至标准清晰响度
+    // 音频响度峰值归一化，限制最大增益以避免把底噪过度放大。
     let maxAbs = 0.0001;
     for (let i = 0; i < mergedPcm.length; i++) {
       const abs = Math.abs(mergedPcm[i]);
@@ -206,7 +224,7 @@ export class VadEngine {
     const durationMs = Math.round((totalLength / this.config.sampleRate) * 1000);
     this.speechChunks = [];
 
-    // 过滤掉低于 0.45 秒的轻微敲击声/咳嗽
+    // 过滤低于 0.45 秒的短促冲击声/咳嗽等误触发。
     if (durationMs >= 450) {
       this.onSpeakingEnd?.(mergedPcm, durationMs);
     }
@@ -216,22 +234,34 @@ export class VadEngine {
     if (this.isSpeaking) {
       this.finalizeSpeechSegment();
     }
+
     if (this.mediaStream) {
       this.mediaStream.getTracks().forEach((t) => t.stop());
       this.mediaStream = null;
     }
+
     if (this.scriptProcessor) {
+      this.scriptProcessor.onaudioprocess = null;
       this.scriptProcessor.disconnect();
       this.scriptProcessor = null;
     }
+
+    if (this.analyser) {
+      this.analyser.disconnect();
+      this.analyser = null;
+    }
+
     if (this.audioContext && this.audioContext.state !== 'closed') {
-      this.audioContext.close();
+      void this.audioContext.close();
       this.audioContext = null;
     }
+
+    this.prefixBuffer = [];
+    this.speechChunks = [];
   }
 }
 
-// 辅助工具：将 Float32 PCM 转换为标准 WAV Blob
+// 将 Float32 PCM 转换为标准 16-bit PCM WAV Blob。
 export function pcmToWavBlob(pcmData: Float32Array, sampleRate = 16000): Blob {
   const numChannels = 1;
   const bitsPerSample = 16;
@@ -264,8 +294,8 @@ export function pcmToWavBlob(pcmData: Float32Array, sampleRate = 16000): Blob {
   return new Blob([buffer], { type: 'audio/wav' });
 }
 
-function writeString(view: DataView, offset: number, string: string) {
-  for (let i = 0; i < string.length; i++) {
-    view.setUint8(offset + i, string.charCodeAt(i));
+function writeString(view: DataView, offset: number, value: string) {
+  for (let i = 0; i < value.length; i++) {
+    view.setUint8(offset + i, value.charCodeAt(i));
   }
 }
