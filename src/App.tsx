@@ -1,16 +1,34 @@
-import { useState } from 'react';
+import { useState, useRef, useCallback } from 'react';
 import { useVoiceListener } from './hooks/useVoiceListener';
 import { StatusHeader } from './components/StatusHeader';
-import { AudioVisualizer } from './components/AudioVisualizer';
-import { TranscriptCard } from './components/TranscriptCard';
-import { ControlFloatingBar } from './components/ControlFloatingBar';
+import { DocumentEditor, DocumentEditorHandle } from './components/DocumentEditor/DocumentEditor';
+import { UnreadTranscriptAnchor } from './components/DocumentEditor/UnreadTranscriptAnchor';
 import { SettingsModal } from './components/SettingsModal';
-import { WaveformIcon } from './components/Icons';
+import { CopyIcon, CheckIcon, DownloadIcon, TrashIcon } from './components/Icons';
 
 export default function App() {
+  const editorRef = useRef<DocumentEditorHandle | null>(null);
+
+  const [charCount, setCharCount] = useState<number>(0);
+  const [unreadCount, setUnreadCount] = useState<number>(0);
+  const [isCopied, setIsCopied] = useState<boolean>(false);
+  const [isSettingsOpen, setIsSettingsOpen] = useState<boolean>(false);
+
+  // ASR 定稿事件回调：安全调用 DocumentEditor 的 appendTranscript
+  const handleTranscriptFinal = useCallback((text: string) => {
+    editorRef.current?.appendTranscript(text);
+  }, []);
+
+  const handleDocChange = useCallback((_text: string, count: number) => {
+    setCharCount(count);
+  }, []);
+
+  const handleUnreadCountChange = useCallback((count: number) => {
+    setUnreadCount(count);
+  }, []);
+
   const {
     state,
-    transcripts,
     volume,
     pauseCountdown,
     vadConfig,
@@ -21,34 +39,63 @@ export default function App() {
     isSwitchingModel,
     handleSwitchModel,
     toggleListening,
-    deleteTranscript,
-    clearAllTranscripts,
+    resetWorkspace,
     updateVadConfig,
-  } = useVoiceListener();
+  } = useVoiceListener({
+    onTranscriptFinal: handleTranscriptFinal,
+  });
 
-  const [isSettingsOpen, setIsSettingsOpen] = useState(false);
+  // 复制全文到剪贴板
+  const handleCopyFullText = async () => {
+    const fullText = editorRef.current?.getContent() || '';
+    if (!fullText.trim()) return;
 
-  // 导出全部转写文本为 Markdown
-  const handleExportMarkdown = () => {
-    if (transcripts.length === 0) return;
-    const content = transcripts
-      .slice()
-      .reverse()
-      .map((t) => `### [${t.timeString}] (${(t.durationMs / 1000).toFixed(1)}s - ${t.modelName || activeModel})\n\n${t.text}\n`)
-      .join('\n---\n\n');
+    try {
+      await navigator.clipboard.writeText(fullText);
+      setIsCopied(true);
+      setTimeout(() => setIsCopied(false), 2000);
+    } catch {
+      // fallback
+    }
+  };
 
-    const blob = new Blob([content], { type: 'text/markdown;charset=utf-8' });
+  // 导出为 Markdown / TXT 文档
+  const handleExportDocument = () => {
+    const fullText = editorRef.current?.getContent() || '';
+    if (!fullText.trim()) return;
+
+    const blob = new Blob([fullText], { type: 'text/markdown;charset=utf-8' });
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
     a.href = url;
-    a.download = `语音转写记录_${new Date().toISOString().slice(0, 10)}.md`;
+    a.download = `语音转录纪要_${new Date().toISOString().slice(0, 10)}.md`;
     a.click();
     URL.revokeObjectURL(url);
   };
 
+  // 清空文档与后台 Generation
+  const handleClearAll = () => {
+    if (window.confirm('确定要清空文档内容吗？')) {
+      editorRef.current?.clearContent();
+      resetWorkspace();
+      setCharCount(0);
+      setUnreadCount(0);
+    }
+  };
+
+  // 状态栏动态指示文案
+  let statusDetail = '就绪';
+  if (state === 'LISTENING_SILENCE') statusDetail = '正在监听环境音 (开口说话自动捕捉)';
+  if (state === 'SPEAKING_ACTIVE') statusDetail = '正在收听说话中...';
+  if (state === 'PAUSE_WAITING') {
+    const sec = (pauseCountdown / 1000).toFixed(1);
+    statusDetail = `停顿检测 (${sec}s 后自动追加定稿)`;
+  }
+  if (state === 'TRANSCRIBING') statusDetail = 'ASR 大模型正在极速转写...';
+
   return (
     <div className="app-container">
-      {/* 顶部极简状态栏（包含多模型切换） */}
+      {/* 顶部极简主控栏 */}
       <StatusHeader
         state={state}
         serverOnline={serverOnline}
@@ -57,49 +104,68 @@ export default function App() {
         availableModels={availableModels}
         isSwitchingModel={isSwitchingModel}
         onSwitchModel={handleSwitchModel}
-      />
-
-      {/* 极简动态声波可视化 */}
-      <AudioVisualizer
-        state={state}
-        volume={volume}
-        pauseCountdown={pauseCountdown}
-      />
-
-      {/* 历史转写段落流式列表 */}
-      <main className="transcript-list">
-        {transcripts.length === 0 ? (
-          <div className="empty-state">
-            <WaveformIcon size={40} className="empty-state-icon" />
-            <p style={{ fontSize: '0.92rem', color: 'var(--text-muted)' }}>
-              暂无语音转写记录
-            </p>
-            <p style={{ fontSize: '0.8rem', color: 'var(--text-subtle)', maxWidth: '320px' }}>
-              点击下方按钮开启常驻监听。支持自由切换 SenseVoice 与 Whisper large-v3 模型。
-            </p>
-          </div>
-        ) : (
-          transcripts.map((item) => (
-            <TranscriptCard
-              key={item.id}
-              item={item}
-              onDelete={deleteTranscript}
-            />
-          ))
-        )}
-      </main>
-
-      {/* 底部悬浮主控栏 */}
-      <ControlFloatingBar
-        state={state}
-        onToggle={toggleListening}
+        onToggleListening={toggleListening}
         onOpenSettings={() => setIsSettingsOpen(true)}
-        onClear={clearAllTranscripts}
-        onExport={handleExportMarkdown}
-        hasItems={transcripts.length > 0}
       />
 
-      {/* 参数调节弹窗 */}
+      {/* 核心文档编辑主工作区 (CodeMirror 6 纯白备忘录纸张) */}
+      <div className="editor-main-wrapper">
+        <DocumentEditor
+          ref={editorRef}
+          onDocChange={handleDocChange}
+          onUnreadCountChange={handleUnreadCountChange}
+        />
+
+        {/* 智能未读听写悬浮胶囊 (用户阅读上文时出现，点击平滑触底) */}
+        <UnreadTranscriptAnchor
+          unreadCount={unreadCount}
+          onClick={() => editorRef.current?.scrollToBottom()}
+        />
+      </div>
+
+      {/* 底部极简状态与操作栏 */}
+      <footer className="bottom-status-bar">
+        <div className="status-indicator-group">
+          <div className="voice-pulse-dot" data-state={state} style={{ transform: `scale(${1 + Math.min(1, volume * 15)})` }} />
+          <span className="status-text">{statusDetail}</span>
+        </div>
+
+        <div className="footer-actions-group">
+          <span className="char-counter">字数: {charCount}</span>
+
+          <button
+            className={`action-pill-btn ${isCopied ? 'copied' : ''}`}
+            onClick={handleCopyFullText}
+            title="一键复制文档全文"
+            disabled={charCount === 0}
+          >
+            {isCopied ? <CheckIcon size={14} /> : <CopyIcon size={14} />}
+            <span>{isCopied ? '已复制' : '复制全文'}</span>
+          </button>
+
+          <button
+            className="action-pill-btn"
+            onClick={handleExportDocument}
+            title="导出为 Markdown 文件"
+            disabled={charCount === 0}
+          >
+            <DownloadIcon size={14} />
+            <span>导出</span>
+          </button>
+
+          <button
+            className="action-pill-btn danger"
+            onClick={handleClearAll}
+            title="清空当前文档"
+            disabled={charCount === 0}
+          >
+            <TrashIcon size={14} />
+            <span>清空</span>
+          </button>
+        </div>
+      </footer>
+
+      {/* 监听参数调节弹窗 */}
       <SettingsModal
         isOpen={isSettingsOpen}
         onClose={() => setIsSettingsOpen(false)}

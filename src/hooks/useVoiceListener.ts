@@ -1,18 +1,14 @@
 import { useState, useRef, useEffect, useCallback } from 'react';
-import { ListenerState, TranscriptItem, VadConfig, ModelInfo } from '../types';
+import { ListenerState, TranscriptSegment, VadConfig, ModelInfo } from '../types';
 import { VadEngine, DEFAULT_VAD_CONFIG, pcmToWavBlob } from '../services/vadEngine';
 import { transcribeAudioBlob, checkAsrHealth, fetchAvailableModels, switchActiveModel } from '../services/asrService';
-import { loadTranscripts, saveTranscripts } from '../services/storageService';
 
-function revokeAudioUrl(item: TranscriptItem | undefined) {
-  if (item?.audioBlobUrl?.startsWith('blob:')) {
-    URL.revokeObjectURL(item.audioBlobUrl);
-  }
+interface UseVoiceListenerOptions {
+  onTranscriptFinal?: (text: string, segment: TranscriptSegment) => void;
 }
 
-export function useVoiceListener() {
+export function useVoiceListener(options?: UseVoiceListenerOptions) {
   const [state, setState] = useState<ListenerState>('IDLE');
-  const [transcripts, setTranscripts] = useState<TranscriptItem[]>(() => loadTranscripts());
   const [volume, setVolume] = useState<number>(0);
   const [pauseCountdown, setPauseCountdown] = useState<number>(0);
   const [vadConfig, setVadConfig] = useState<VadConfig>(DEFAULT_VAD_CONFIG);
@@ -21,9 +17,13 @@ export function useVoiceListener() {
   const [activeModelId, setActiveModelId] = useState<string>('sensevoice-onnx');
   const [availableModels, setAvailableModels] = useState<ModelInfo[]>([]);
   const [isSwitchingModel, setIsSwitchingModel] = useState<boolean>(false);
+  const [segments, setSegments] = useState<TranscriptSegment[]>([]);
 
+  // 关键：Document Generation Token (防清空或切换后的旧请求迟到竞态复活)
+  const documentGenerationRef = useRef<number>(1);
   const engineRef = useRef<VadEngine | null>(null);
-  const transcriptsRef = useRef<TranscriptItem[]>(transcripts);
+  const optionsRef = useRef(options);
+  optionsRef.current = options;
 
   // 定期检测本地 ASR 服务健康度与模型列表
   const refreshServerStatus = useCallback(async () => {
@@ -49,21 +49,6 @@ export function useVoiceListener() {
     return () => clearInterval(timer);
   }, [refreshServerStatus]);
 
-  // 保存文字记录；Blob URL 仅属于当前运行时，不写入 localStorage。
-  useEffect(() => {
-    transcriptsRef.current = transcripts;
-    saveTranscripts(transcripts);
-  }, [transcripts]);
-
-  // 页面卸载时释放麦克风以及所有仍存活的 Blob URL，避免长时间运行/热重载后的资源泄漏。
-  useEffect(() => {
-    return () => {
-      engineRef.current?.stop();
-      engineRef.current = null;
-      transcriptsRef.current.forEach(revokeAudioUrl);
-    };
-  }, []);
-
   // 切换 ASR 识别模型
   const handleSwitchModel = useCallback(async (modelId: string) => {
     setIsSwitchingModel(true);
@@ -86,44 +71,49 @@ export function useVoiceListener() {
     setState('TRANSCRIBING');
     setPauseCountdown(0);
 
+    // 绑定当前发起任务时的 Generation Token
+    const jobGeneration = documentGenerationRef.current;
+    const now = Date.now();
+    const startedAt = now - durationMs;
+    const endedAt = now;
     const wavBlob = pcmToWavBlob(pcmData, vadConfig.sampleRate);
-    const now = new Date();
-    const timeString = `${String(now.getHours()).padStart(2, '0')}:${String(now.getMinutes()).padStart(2, '0')}:${String(now.getSeconds()).padStart(2, '0')}`;
-    const itemId = `trans-${Date.now()}-${Math.random().toString(36).substring(2, 7)}`;
+    const audioUrl = URL.createObjectURL(wavBlob);
 
     try {
       const res = await transcribeAudioBlob(wavBlob);
+      
+      // 竞态校验：若用户在识别过程中点击了清空，或文档代数已更新，彻底丢弃此迟到结果
+      if (jobGeneration !== documentGenerationRef.current) {
+        console.log('[ASR] Discarding stale transcript due to generation mismatch:', res.text);
+        URL.revokeObjectURL(audioUrl);
+        return;
+      }
+
       if (res.text) {
-        const newItem: TranscriptItem = {
-          id: itemId,
-          timestamp: Date.now(),
-          timeString,
-          text: res.text,
+        const segment: TranscriptSegment = {
+          id: `seg-${Date.now()}-${Math.random().toString(36).substring(2, 7)}`,
+          generation: jobGeneration,
+          startedAt,
+          endedAt,
+          originalText: res.text, // 原始 ASR 证据不可变
+          modelId: res.modelId || activeModelId,
           durationMs,
-          audioBlobUrl: URL.createObjectURL(wavBlob),
-          modelName: activeModel,
+          audioBlobUrl: audioUrl,
+          createdAt: Date.now(),
         };
-        setTranscripts((prev) => [newItem, ...prev]);
+
+        setSegments((prev) => [...prev, segment]);
+        optionsRef.current?.onTranscriptFinal?.(res.text, segment);
       }
     } catch (err: unknown) {
       console.error('ASR transcription failed:', err);
-      const errMsg = err instanceof Error ? err.message : String(err);
-      const errorItem: TranscriptItem = {
-        id: itemId,
-        timestamp: Date.now(),
-        timeString,
-        text: `[转写失败] ${errMsg}`,
-        durationMs,
-        audioBlobUrl: URL.createObjectURL(wavBlob),
-        modelName: activeModel,
-      };
-      setTranscripts((prev) => [errorItem, ...prev]);
+      URL.revokeObjectURL(audioUrl);
     } finally {
       if (engineRef.current) {
         setState('LISTENING_SILENCE');
       }
     }
-  }, [vadConfig.sampleRate, activeModel]);
+  }, [vadConfig.sampleRate, activeModelId]);
 
   // 启动常驻监听
   const startListening = useCallback(async () => {
@@ -178,23 +168,15 @@ export function useVoiceListener() {
     }
   }, [state, startListening, stopListening]);
 
-  // 删除单条记录，同时释放当前运行时音频 URL。
-  const deleteTranscript = useCallback((id: string) => {
-    setTranscripts((prev) => {
-      const target = prev.find((item) => item.id === id);
-      revokeAudioUrl(target);
-      return prev.filter((item) => item.id !== id);
-    });
-  }, []);
-
-  // 清空所有记录
-  const clearAllTranscripts = useCallback(() => {
-    if (window.confirm('确定要清空所有已转写的语音记录吗？')) {
-      setTranscripts((prev) => {
-        prev.forEach(revokeAudioUrl);
-        return [];
+  // 清空文档与底层 Segments（同时递增 Generation Token 杜绝竞态）
+  const resetWorkspace = useCallback(() => {
+    documentGenerationRef.current += 1;
+    setSegments((prev) => {
+      prev.forEach((s) => {
+        if (s.audioBlobUrl) URL.revokeObjectURL(s.audioBlobUrl);
       });
-    }
+      return [];
+    });
   }, []);
 
   // 更新设置
@@ -208,7 +190,7 @@ export function useVoiceListener() {
 
   return {
     state,
-    transcripts,
+    segments,
     volume,
     pauseCountdown,
     vadConfig,
@@ -219,8 +201,7 @@ export function useVoiceListener() {
     isSwitchingModel,
     handleSwitchModel,
     toggleListening,
-    deleteTranscript,
-    clearAllTranscripts,
+    resetWorkspace,
     updateVadConfig,
   };
 }
