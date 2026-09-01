@@ -35,6 +35,18 @@ export const WaveformIcon: React.FC<IconProps> = ({ size = 20, className = '', .
   </svg>
 );
 
+export const PlayIcon: React.FC<IconProps> = ({ size = 16, className = '' }) => (
+  <svg
+    width={size}
+    height={size}
+    viewBox="0 0 24 24"
+    fill="currentColor"
+    className={className}
+  >
+    <polygon points="5 3 19 12 5 21 5 3" />
+  </svg>
+);
+
 export const CopyIcon: React.FC<IconProps> = ({ size = 18, className = '', ...props }) => (
   <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className={className} {...props}>
     <rect width="14" height="14" x="8" y="8" rx="2" ry="2" />
