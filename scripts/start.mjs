@@ -35,13 +35,27 @@ if (!existsSync(nodeModulesPath)) {
   console.log(green('[成功] 前端依赖安装完成！\n'));
 }
 
-// 2. 检查模型文件完整性 (Silero VAD, SenseVoice, Streaming Paraformer)
+// 2. 检查模型文件完整性 (Silero VAD, SenseVoice, Streaming Paraformer 全量文件)
 const modelsDir = resolve(rootDir, 'models');
 const vadModel = resolve(modelsDir, 'silero_vad.onnx');
-const sensevoiceModel = resolve(modelsDir, 'sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17', 'model.int8.onnx');
-const paraformerModel = resolve(modelsDir, 'sherpa-onnx-streaming-paraformer-bilingual-zh-en', 'encoder.int8.onnx');
+const sensevoiceDir = resolve(modelsDir, 'sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17');
+const sensevoiceModel = existsSync(resolve(sensevoiceDir, 'model.int8.onnx')) || existsSync(resolve(sensevoiceDir, 'model.onnx'));
+const sensevoiceTokens = resolve(sensevoiceDir, 'tokens.txt');
 
-if (!existsSync(vadModel) || !existsSync(sensevoiceModel) || !existsSync(paraformerModel)) {
+const paraformerDir = resolve(modelsDir, 'sherpa-onnx-streaming-paraformer-bilingual-zh-en');
+const paraformerEncoder = resolve(paraformerDir, 'encoder.int8.onnx');
+const paraformerDecoder = resolve(paraformerDir, 'decoder.int8.onnx');
+const paraformerTokens = resolve(paraformerDir, 'tokens.txt');
+
+const allModelsPresent =
+  existsSync(vadModel) &&
+  sensevoiceModel &&
+  existsSync(sensevoiceTokens) &&
+  existsSync(paraformerEncoder) &&
+  existsSync(paraformerDecoder) &&
+  existsSync(paraformerTokens);
+
+if (!allModelsPresent) {
   console.log(yellow('[提示] 检测到模型文件不完整，正在自动补全/拉取模型...'));
   const pyCmd = isWin ? 'python' : 'python3';
   spawnSync(pyCmd, ['download_models.py'], { cwd: rootDir, stdio: 'inherit' });

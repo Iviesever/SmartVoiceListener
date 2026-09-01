@@ -658,9 +658,9 @@ async def websocket_stream_endpoint(ws: WebSocket):
                             }
                         )
 
-                # 防御性单段 90 秒最大时长保护
+                # 防御性单段 120 秒最大时长保险（避免与前端 90s 主控竞争，纯做异常断网兜底）
                 total_samples = sum(len(c) for c in audio_chunks)
-                if total_samples >= 16000 * 90:
+                if total_samples >= 16000 * 120:
                     sealed_audio = np.concatenate(audio_chunks)
                     captured_model = model_manager.selected_model_id
                     job = FinalJob(

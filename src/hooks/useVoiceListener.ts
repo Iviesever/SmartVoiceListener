@@ -139,9 +139,15 @@ export function useVoiceListener(options?: UseVoiceListenerOptions) {
 
       const engine = new AudioCaptureEngine(vadConfig);
 
-      // 0. WebSocket 握手就绪回调
+      // 0. WebSocket 握手就绪与连接状态回调
       engine.transport.onStreamReady = (_sampleRate, ready) => {
         setStreamingReady(ready);
+      };
+
+      engine.onConnectionChange = (connected) => {
+        if (!connected) {
+          setStreamingReady(false);
+        }
       };
 
       // 1. 说话开始回调

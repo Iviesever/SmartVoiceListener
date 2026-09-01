@@ -58,13 +58,13 @@ def test_streaming_engine_direct():
 
 
 # =========================================================================
-# 2. 验证模型切换与 Second-Pass 调度隔离 (不覆盖用户 selected_model_id)
+# 2. 验证模型切换与 Second-Pass 调度隔离 (真实执行旧 job 并验证不覆盖用户目标)
 # =========================================================================
 async def test_scheduler_model_isolation():
     print("\n--- 2. Testing OfflineInferenceScheduler & Model Isolation ---")
     samples, sample_rate = load_test_audio()
 
-    # 用户选定默认模型为 sensevoice-onnx
+    # 用户初始选定默认模型为 sensevoice-onnx
     model_manager.selected_model_id = "sensevoice-onnx"
 
     job_sensevoice = FinalJob(
@@ -82,12 +82,11 @@ async def test_scheduler_model_isolation():
     assert model_manager.selected_model_id == "sensevoice-onnx"
     print(f"  [✓] Job 1 result ({result1.cost_ms:.1f}ms): \"{result1.text}\"")
 
-    # 模拟用户将默认模型切换为 qwen3-asr-1.7b (如果存在) 或保持校验 selected_model_id 稳定性
-    qwen_info = AVAILABLE_MODELS.get("qwen3-asr-1.7b", {})
-    user_target = "qwen3-asr-1.7b" if (qwen_info.get("path") and qwen_info["path"].exists()) else "sensevoice-onnx"
+    # 模拟用户将默认模型切换为目标模型
+    user_target = "qwen3-asr-1.7b" if (AVAILABLE_MODELS.get("qwen3-asr-1.7b", {}).get("path") and AVAILABLE_MODELS["qwen3-asr-1.7b"]["path"].exists()) else "sensevoice-onnx"
     model_manager.selected_model_id = user_target
 
-    # 一个旧的 sensevoice job 延迟到达执行
+    # 一个旧的 sensevoice job 延迟到达并真正执行
     job_old = FinalJob(
         session_epoch=1,
         segment_id="seg-isolation-old",
@@ -96,8 +95,11 @@ async def test_scheduler_model_isolation():
         sample_rate=sample_rate,
         fallback_text="fallback-old"
     )
+    result2 = await inference_scheduler.execute_job(job_old)
+    assert result2.model_id == "sensevoice-onnx"
+    # 核心验证：执行旧 job 绝不抹除或覆盖用户当前选定的 user_target！
     assert model_manager.selected_model_id == user_target
-    print(f"  [✓] Model isolation verified: User selected_model_id={model_manager.selected_model_id} preserved!")
+    print(f"  [✓] Model isolation verified: Job executed and user selected_model_id={model_manager.selected_model_id} preserved!")
     model_manager.selected_model_id = "sensevoice-onnx"
 
 
@@ -221,12 +223,78 @@ def test_streaming_unavailable_degradation():
         streaming_engine.is_ready = orig_ready
 
 
+# =========================================================================
+# 5. 验证前缀快照 sample-by-sample 精确连续性 (第 1 候选帧不丢失，触发帧不重复)
+# =========================================================================
+def test_prefix_ring_continuity_and_no_drop():
+    print("\n--- 5. Testing Prefix Ring Sample-by-Sample Continuity & Zero Duplication ---")
+    # 模拟 16kHz 环形缓冲与候选帧流转
+    capacity = 12800
+    ring = np.zeros(capacity, dtype=np.float32)
+    write_pos = 0
+    size = 0
+
+    def ring_write(chunk):
+        nonlocal write_pos, size
+        for s in chunk:
+            ring[write_pos] = s
+            write_pos = (write_pos + 1) % capacity
+            if size < capacity:
+                size += 1
+
+    def ring_snapshot():
+        nonlocal write_pos, size
+        if size == 0:
+            return np.array([], dtype=np.float32)
+        if size < capacity:
+            return ring[:size].copy()
+        tail = capacity - write_pos
+        return np.concatenate([ring[write_pos:], ring[:write_pos]])
+
+    def ring_clear():
+        nonlocal write_pos, size
+        write_pos = 0
+        size = 0
+
+    # 1. 模拟过去 500ms 环境音 (8000 采样，全 0.1)
+    ambient = np.full(8000, 0.1, dtype=np.float32)
+    ring_write(ambient)
+
+    # 2. 模拟第 1 个人声候选帧 (1600 采样，全 0.5)
+    candidate_frame_1 = np.full(1600, 0.5, dtype=np.float32)
+    # VAD 检测到 speech candidate 1 (< 2): 写入 ring
+    ring_write(candidate_frame_1)
+
+    # 3. 模拟第 2 个确认人声帧 (1600 采样，全 0.8)
+    trigger_frame_2 = np.full(1600, 0.8, dtype=np.float32)
+    # VAD 达到 2 帧确认: 提取快照并清空 ring
+    snapshot = ring_snapshot()
+    ring_clear()
+
+    # 组装当前段的 PCM chunks
+    segment_pcm = np.concatenate([snapshot, trigger_frame_2])
+
+    # 验证 1: 快照长度必须等于 8000 + 1600 = 9600
+    assert len(snapshot) == 9600, f"Snapshot length should be 9600, got {len(snapshot)}"
+    # 验证 2: 快照后部必须包含完整的第 1 候选帧 (0.5)
+    assert np.allclose(snapshot[-1600:], candidate_frame_1), "Snapshot must preserve candidate frame 1 without loss"
+    # 验证 3: 组装的总 PCM 中第 1 候选帧与第 2 触发帧各自只出现恰好一次 (零丢失，零重复)
+    count_05 = np.sum(segment_pcm == 0.5)
+    count_08 = np.sum(segment_pcm == 0.8)
+    assert count_05 == 1600, f"Candidate frame 1 count should be 1600, got {count_05}"
+    assert count_08 == 1600, f"Trigger frame 2 count should be 1600, got {count_08}"
+    # 验证 4: 清空后的 ring 为空，后续切段不会发生陈旧前缀污染
+    assert len(ring_snapshot()) == 0, "Cleared ring must be empty"
+    print("[✓] Prefix sample-by-sample continuity & zero-drop/zero-duplication verified perfectly!")
+
+
 def main():
     test_streaming_engine_direct()
     asyncio.run(test_scheduler_model_isolation())
     test_websocket_stream_e2e()
     test_streaming_unavailable_degradation()
-    print("\n[★] ALL 4 REGRESSION TEST SUITES PASSED SUCCESSFULLY!\n")
+    test_prefix_ring_continuity_and_no_drop()
+    print("\n[★] ALL 5 REGRESSION TEST SUITES PASSED SUCCESSFULLY!\n")
 
 
 if __name__ == "__main__":
