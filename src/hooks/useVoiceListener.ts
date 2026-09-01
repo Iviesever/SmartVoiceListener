@@ -1,17 +1,18 @@
-import { useState, useRef, useEffect, useCallback } from 'react';
+import { useState, useRef, useEffect, useCallback, useMemo } from 'react';
 import { ListenerState, TranscriptSegment, VadConfig, ModelInfo } from '../types';
 import { AudioCaptureEngine, DEFAULT_VAD_CONFIG, pcmToWavBlob } from '../services/audioCaptureEngine';
 import { checkAsrHealth, fetchAvailableModels, switchActiveModel } from '../services/asrService';
 import { loadSavedSegments, saveSegments } from '../services/storageService';
 
 interface UseVoiceListenerOptions {
-  onTranscriptPartial?: (text: string, segmentId: string) => void;
+  onTranscriptPartial?: (segmentId: string, text: string) => void;
   onTranscriptSpeechEnd?: (segmentId: string) => void;
-  onTranscriptFinal?: (text: string, segment: TranscriptSegment) => void;
+  onTranscriptFinal?: (segmentId: string, text: string, segment: TranscriptSegment) => void;
 }
 
 export function useVoiceListener(options?: UseVoiceListenerOptions) {
-  const [state, setState] = useState<ListenerState>('IDLE');
+  const [captureState, setCaptureState] = useState<'IDLE' | 'LISTENING_SILENCE' | 'SPEAKING_ACTIVE' | 'PAUSE_WAITING'>('IDLE');
+  const [pendingFinalCount, setPendingFinalCount] = useState<number>(0);
   const [volume, setVolume] = useState<number>(0);
   const [pauseCountdown, setPauseCountdown] = useState<number>(0);
   const [vadConfig, setVadConfig] = useState<VadConfig>(DEFAULT_VAD_CONFIG);
@@ -30,6 +31,15 @@ export function useVoiceListener(options?: UseVoiceListenerOptions) {
 
   const optionsRef = useRef(options);
   optionsRef.current = options;
+
+  // 状态优先级推导：SPEAKING/PAUSE > TRANSCRIBING (存在待定稿队列) > LISTENING_SILENCE > IDLE
+  const state: ListenerState = useMemo(() => {
+    if (captureState === 'IDLE') return 'IDLE';
+    if (captureState === 'SPEAKING_ACTIVE') return 'SPEAKING_ACTIVE';
+    if (captureState === 'PAUSE_WAITING') return 'PAUSE_WAITING';
+    if (pendingFinalCount > 0) return 'TRANSCRIBING';
+    return 'LISTENING_SILENCE';
+  }, [captureState, pendingFinalCount]);
 
   // 定期检测本地 ASR 服务健康度与模型列表
   const refreshServerStatus = useCallback(async () => {
@@ -125,25 +135,32 @@ export function useVoiceListener(options?: UseVoiceListenerOptions) {
 
       sessionEpochRef.current += 1;
       const currentSession = sessionEpochRef.current;
+      setPendingFinalCount(0);
 
       const engine = new AudioCaptureEngine(vadConfig);
 
+      // 0. WebSocket 握手就绪回调
+      engine.transport.onStreamReady = (_sampleRate, ready) => {
+        setStreamingReady(ready);
+      };
+
       // 1. 说话开始回调
       engine.onSpeakingStart = () => {
-        setState('SPEAKING_ACTIVE');
+        setCaptureState('SPEAKING_ACTIVE');
         setPauseCountdown(0);
       };
 
       // 2. 停顿倒计时回调
       engine.onSpeakingPause = (remainingMs) => {
-        setState('PAUSE_WAITING');
+        setCaptureState('PAUSE_WAITING');
         setPauseCountdown(remainingMs);
       };
 
       // 3. 说话结束回调（流式结束，等待 Second-Pass 定稿）
       engine.onSpeakingEnd = (segmentId) => {
-        setState('TRANSCRIBING');
+        setCaptureState('LISTENING_SILENCE');
         setPauseCountdown(0);
+        setPendingFinalCount((prev) => prev + 1);
         optionsRef.current?.onTranscriptSpeechEnd?.(segmentId);
       };
 
@@ -155,11 +172,13 @@ export function useVoiceListener(options?: UseVoiceListenerOptions) {
       // 5. 实时流式 Partial 增量文本
       engine.onPartial = (event) => {
         if (event.sessionEpoch !== sessionEpochRef.current) return;
-        optionsRef.current?.onTranscriptPartial?.(event.text, event.segmentId);
+        optionsRef.current?.onTranscriptPartial?.(event.segmentId, event.text);
       };
 
-      // 6. 二阶段 Final 定稿文本到达
-      engine.onFinal = (event) => {
+      // 6. 二阶段 Final 定稿文本到达 (安全携带 cachedData 真实时间戳与 PCM)
+      engine.onFinal = (event, cachedData) => {
+        setPendingFinalCount((prev) => Math.max(0, prev - 1));
+
         if (event.sessionEpoch !== sessionEpochRef.current) {
           console.log('[ASR] Discarding stale Final due to session epoch change:', event.text);
           return;
@@ -167,23 +186,25 @@ export function useVoiceListener(options?: UseVoiceListenerOptions) {
 
         const trimmed = event.text.trim();
         if (trimmed) {
-          // 生成本地音频 Blob URL（若存在）
           let audioUrl: string | undefined = undefined;
-          const cached = engine.localSegmentCache.get(event.segmentId);
-          if (cached) {
-            const wavBlob = pcmToWavBlob(cached.pcm, 16000);
+          if (cachedData?.pcm) {
+            const wavBlob = pcmToWavBlob(cachedData.pcm, 16000);
             audioUrl = URL.createObjectURL(wavBlob);
           }
 
           const now = Date.now();
+          const startedAt = cachedData?.startedAt || (now - (cachedData?.durationMs || 3000));
+          const endedAt = cachedData?.endedAt || now;
+          const durationMs = cachedData?.durationMs || Math.max(500, endedAt - startedAt);
+
           const segment: TranscriptSegment = {
             id: event.segmentId,
             generation: event.sessionEpoch,
-            startedAt: now - 3000,
-            endedAt: now,
+            startedAt,
+            endedAt,
             originalText: trimmed,
             modelId: event.modelId || activeModelId,
-            durationMs: cached?.durationMs || 3000,
+            durationMs,
             audioBlobUrl: audioUrl,
             createdAt: now,
             finalSource: event.finalSource,
@@ -193,15 +214,12 @@ export function useVoiceListener(options?: UseVoiceListenerOptions) {
           segmentsRef.current = nextSegments;
           setSegments(nextSegments);
 
-          optionsRef.current?.onTranscriptFinal?.(trimmed, segment);
-        }
-
-        if (engineRef.current) {
-          setState('LISTENING_SILENCE');
+          optionsRef.current?.onTranscriptFinal?.(event.segmentId, trimmed, segment);
         }
       };
 
       engine.onError = (event) => {
+        setPendingFinalCount((prev) => Math.max(0, prev - 1));
         console.warn('[ASR] Stream error event:', event);
       };
 
@@ -213,23 +231,23 @@ export function useVoiceListener(options?: UseVoiceListenerOptions) {
       }
 
       engineRef.current = engine;
-      setStreamingReady(true);
-      setState('LISTENING_SILENCE');
+      setCaptureState('LISTENING_SILENCE');
     } catch (err) {
       console.error('Failed to start AudioCaptureEngine:', err);
       alert('启动麦克风失败，请检查浏览器麦克风权限！');
-      setState('IDLE');
+      setCaptureState('IDLE');
     }
   }, [vadConfig, activeModelId]);
 
   // 停止监听
   const stopListening = useCallback(() => {
     sessionEpochRef.current += 1;
+    setPendingFinalCount(0);
     if (engineRef.current) {
       engineRef.current.stop();
       engineRef.current = null;
     }
-    setState('IDLE');
+    setCaptureState('IDLE');
     setVolume(0);
     setPauseCountdown(0);
     setStreamingReady(false);
@@ -237,16 +255,22 @@ export function useVoiceListener(options?: UseVoiceListenerOptions) {
 
   // 切换监听状态
   const toggleListening = useCallback(() => {
-    if (state === 'IDLE') {
+    if (captureState === 'IDLE') {
       void startListening();
     } else {
       stopListening();
     }
-  }, [state, startListening, stopListening]);
+  }, [captureState, startListening, stopListening]);
 
-  // 清空文档与后台 Segments
+  // 清空文档与后台 Segments (关键修复 P0-2：原子同步重置正在运行的 AudioCaptureEngine)
   const resetWorkspace = useCallback(() => {
     sessionEpochRef.current += 1;
+    setPendingFinalCount(0);
+
+    // 原子同步给正在运行的 engine 传递全新 epoch，取消飞行中的说话段
+    if (engineRef.current) {
+      engineRef.current.resetSession(sessionEpochRef.current);
+    }
 
     const previousSegments = segmentsRef.current;
     previousSegments.forEach((s) => {

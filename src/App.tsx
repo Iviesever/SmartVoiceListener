@@ -13,7 +13,6 @@ export default function App() {
   // 初始加载历史保存文档
   const initialDocumentRef = useRef<string>(loadSavedDocument());
   const latestDocRef = useRef<string>(initialDocumentRef.current);
-  const lastStreamingPartialTextRef = useRef<string>('');
 
   const [charCount, setCharCount] = useState<number>(() => {
     return initialDocumentRef.current.replace(/\s/g, '').length;
@@ -24,32 +23,19 @@ export default function App() {
 
   const saveTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
-  // 1. 流式 Partial 增量回调（更新视觉投影，零文档污染）
-  const handleTranscriptPartial = useCallback((text: string, segmentId: string) => {
-    lastStreamingPartialTextRef.current = text;
-    editorRef.current?.setStreamingPartial({
-      text,
-      segmentId,
-      isEnded: false,
-    });
+  // 1. 实时流式 Partial 增量回调（按 segmentId 更新独立的 live ephemeral 投影）
+  const handleTranscriptPartial = useCallback((segmentId: string, text: string) => {
+    editorRef.current?.setStreamingPartial(segmentId, text);
   }, []);
 
-  // 2. 说话结束回调（保持最后一版灰字显示，呼吸光标静止，防止 Final 到来前视觉闪断）
+  // 2. 某一段说话结束回调（将该段置为 sealed 状态，光标静止，防止 Final 异步返回前视觉闪断）
   const handleTranscriptSpeechEnd = useCallback((segmentId: string) => {
-    if (lastStreamingPartialTextRef.current) {
-      editorRef.current?.setStreamingPartial({
-        text: lastStreamingPartialTextRef.current,
-        segmentId,
-        isEnded: true,
-      });
-    }
+    editorRef.current?.sealStreamingPartial(segmentId);
   }, []);
 
-  // 3. 二阶段 Final 定稿回调：移除 Partial 投影并正式将定稿文本追加写入文档
-  const handleTranscriptFinal = useCallback((text: string) => {
-    lastStreamingPartialTextRef.current = '';
-    editorRef.current?.clearStreamingPartial();
-    editorRef.current?.appendTranscript(text);
+  // 3. 二阶段 Final 定稿回调：原子性提交该段 Final 正文，并精准仅移除该 segmentId 的 ephemeral 投影
+  const handleTranscriptFinal = useCallback((segmentId: string, text: string) => {
+    editorRef.current?.commitStreamingFinal(segmentId, text);
   }, []);
 
   // 文档内容变化防抖持久化 (600ms debounce)
@@ -72,6 +58,7 @@ export default function App() {
     pauseCountdown,
     vadConfig,
     serverOnline,
+    streamingReady,
     activeModel,
     activeModelId,
     availableModels,
@@ -144,7 +131,6 @@ export default function App() {
     if (window.confirm('确定要清空文档内容吗？')) {
       if (saveTimerRef.current) clearTimeout(saveTimerRef.current);
       latestDocRef.current = '';
-      lastStreamingPartialTextRef.current = '';
       saveDocumentContent('');
       editorRef.current?.clearStreamingPartial();
       editorRef.current?.clearContent();
@@ -156,7 +142,11 @@ export default function App() {
 
   // 状态栏动态指示文案
   let statusDetail = '就绪';
-  if (state === 'LISTENING_SILENCE') statusDetail = '正在监听环境音 (开口说话自动捕捉)';
+  if (state === 'LISTENING_SILENCE') {
+    statusDetail = streamingReady
+      ? '正在监听环境音 (开口说话自动捕捉)'
+      : '正在监听环境音 (流式引擎未就绪，使用离线定稿)';
+  }
   if (state === 'SPEAKING_ACTIVE') statusDetail = '正在实时流式识别 (Partial)...';
   if (state === 'PAUSE_WAITING') {
     const sec = (pauseCountdown / 1000).toFixed(1);
@@ -179,7 +169,7 @@ export default function App() {
         onOpenSettings={() => setIsSettingsOpen(true)}
       />
 
-      {/* 核心文档编辑主工作区 (CodeMirror 6 纯白备忘录纸张 + Inline Ephemeral Partial) */}
+      {/* 核心文档编辑主工作区 (CodeMirror 6 纯白备忘录纸张 + 多段重叠 Ephemeral Tail) */}
       <div className="editor-main-wrapper">
         <DocumentEditor
           ref={editorRef}
@@ -188,7 +178,7 @@ export default function App() {
           onUnreadCountChange={handleUnreadCountChange}
         />
 
-        {/* 智能未读听写悬浮胶囊 (用户阅读上文时出现，点击平滑触底) */}
+        {/* 智能未读听写悬浮胶囊 */}
         <UnreadTranscriptAnchor
           unreadCount={unreadCount}
           onClick={() => editorRef.current?.scrollToBottom()}

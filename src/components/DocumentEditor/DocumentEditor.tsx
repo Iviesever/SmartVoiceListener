@@ -2,17 +2,14 @@ import { useEffect, useRef, useImperativeHandle, forwardRef, useCallback } from 
 import { EditorState, Transaction, StateField, StateEffect } from '@codemirror/state';
 import { EditorView, keymap, placeholder, Decoration, DecorationSet, WidgetType } from '@codemirror/view';
 import { defaultKeymap, history, historyKeymap } from '@codemirror/commands';
-
-export interface StreamingPartialPayload {
-  text: string;
-  segmentId?: string;
-  isEnded?: boolean;
-}
+import { EphemeralSegment } from '../../types';
 
 export interface DocumentEditorHandle {
   appendTranscript: (text: string) => void;
-  setStreamingPartial: (payload: StreamingPartialPayload) => void;
-  clearStreamingPartial: () => void;
+  setStreamingPartial: (segmentId: string, text: string) => void;
+  sealStreamingPartial: (segmentId: string) => void;
+  commitStreamingFinal: (segmentId: string, finalText: string) => void;
+  clearStreamingPartial: (segmentId?: string) => void;
   clearContent: () => void;
   getContent: () => string;
   scrollToBottom: () => void;
@@ -25,18 +22,16 @@ interface DocumentEditorProps {
 }
 
 // -----------------------------------------------------------------------------
-// CodeMirror 6 Block Widget for Inline Ephemeral Partial
+// CodeMirror 6 Block Widget for Multi-Segment Ephemeral Tail
 // -----------------------------------------------------------------------------
 
-export const setStreamingPartialEffect = StateEffect.define<StreamingPartialPayload>();
-export const clearStreamingPartialEffect = StateEffect.define<void>();
+export const setStreamingPartialEffect = StateEffect.define<EphemeralSegment>();
+export const sealStreamingPartialEffect = StateEffect.define<string>();
+export const commitStreamingFinalEffect = StateEffect.define<string>();
+export const clearAllStreamingEffect = StateEffect.define<void>();
 
-class StreamingPartialBlockWidget extends WidgetType {
-  constructor(
-    readonly text: string,
-    readonly segmentId?: string,
-    readonly isEnded?: boolean
-  ) {
+class StreamingTailBlockWidget extends WidgetType {
+  constructor(readonly segments: EphemeralSegment[]) {
     super();
   }
 
@@ -44,69 +39,129 @@ class StreamingPartialBlockWidget extends WidgetType {
     const wrap = document.createElement('div');
     wrap.className = 'cm-streaming-block';
 
-    const textSpan = document.createElement('span');
-    textSpan.className = 'cm-streaming-text';
-    textSpan.textContent = this.text;
-    wrap.appendChild(textSpan);
+    for (const seg of this.segments) {
+      const segEl = document.createElement('div');
+      segEl.className = 'cm-streaming-segment';
+      segEl.dataset.segmentId = seg.segmentId;
 
-    const caret = document.createElement('span');
-    caret.className = `cm-streaming-caret ${this.isEnded ? 'frozen' : ''}`;
-    caret.textContent = '▌';
-    wrap.appendChild(caret);
+      const textSpan = document.createElement('span');
+      textSpan.className = 'cm-streaming-text';
+      textSpan.textContent = seg.text;
+      segEl.appendChild(textSpan);
+
+      const caret = document.createElement('span');
+      caret.className = `cm-streaming-caret ${seg.status === 'sealed' ? 'frozen' : ''}`;
+      caret.textContent = '▌';
+      segEl.appendChild(caret);
+
+      wrap.appendChild(segEl);
+    }
 
     return wrap;
   }
 
   updateDOM(dom: HTMLElement): boolean {
-    const textSpan = dom.querySelector('.cm-streaming-text');
-    const caret = dom.querySelector('.cm-streaming-caret');
-    if (textSpan) {
-      textSpan.textContent = this.text;
+    const existingSegEls = Array.from(dom.querySelectorAll<HTMLElement>('.cm-streaming-segment'));
+    
+    // 若段落数量不一致，直接整块重新渲染
+    if (existingSegEls.length !== this.segments.length) {
+      return false;
     }
-    if (caret) {
-      caret.className = `cm-streaming-caret ${this.isEnded ? 'frozen' : ''}`;
+
+    for (let i = 0; i < this.segments.length; i++) {
+      const seg = this.segments[i];
+      const el = existingSegEls[i];
+      if (!el || el.dataset.segmentId !== seg.segmentId) {
+        return false;
+      }
+
+      const textSpan = el.querySelector('.cm-streaming-text');
+      const caret = el.querySelector('.cm-streaming-caret');
+      if (textSpan && textSpan.textContent !== seg.text) {
+        textSpan.textContent = seg.text;
+      }
+      if (caret) {
+        caret.className = `cm-streaming-caret ${seg.status === 'sealed' ? 'frozen' : ''}`;
+      }
     }
     return true;
   }
 
-  eq(other: StreamingPartialBlockWidget): boolean {
-    return (
-      other.text === this.text &&
-      other.segmentId === this.segmentId &&
-      other.isEnded === this.isEnded
-    );
+  eq(other: StreamingTailBlockWidget): boolean {
+    if (other.segments.length !== this.segments.length) return false;
+    for (let i = 0; i < this.segments.length; i++) {
+      const a = this.segments[i];
+      const b = other.segments[i];
+      if (a.segmentId !== b.segmentId || a.text !== b.text || a.status !== b.status) {
+        return false;
+      }
+    }
+    return true;
   }
 }
 
-export const streamingPartialField = StateField.define<DecorationSet>({
+export const streamingTailField = StateField.define<{ segments: EphemeralSegment[]; decorations: DecorationSet }>({
   create() {
-    return Decoration.none;
+    return { segments: [], decorations: Decoration.none };
   },
-  update(decorations, tr) {
-    decorations = decorations.map(tr.changes);
+  update(value, tr) {
+    let segments = [...value.segments];
+    let changed = false;
 
     for (const effect of tr.effects) {
       if (effect.is(setStreamingPartialEffect)) {
-        const { text, segmentId, isEnded } = effect.value;
-        const trimmed = text.trim();
-        if (!trimmed) {
-          decorations = Decoration.none;
+        const incoming = effect.value;
+        const trimmed = incoming.text.trim();
+        if (!trimmed) continue;
+
+        const idx = segments.findIndex((s) => s.segmentId === incoming.segmentId);
+        if (idx >= 0) {
+          segments[idx] = { ...incoming, text: trimmed };
         } else {
-          const docLen = tr.state.doc.length;
-          const widget = Decoration.widget({
-            widget: new StreamingPartialBlockWidget(trimmed, segmentId, isEnded),
-            side: 1,
-            block: true,
-          });
-          decorations = Decoration.set([widget.range(docLen)]);
+          segments.push({ ...incoming, text: trimmed });
         }
-      } else if (effect.is(clearStreamingPartialEffect)) {
-        decorations = Decoration.none;
+        changed = true;
+      } else if (effect.is(sealStreamingPartialEffect)) {
+        const segId = effect.value;
+        const idx = segments.findIndex((s) => s.segmentId === segId);
+        if (idx >= 0 && segments[idx].status !== 'sealed') {
+          segments[idx] = { ...segments[idx], status: 'sealed' };
+          changed = true;
+        }
+      } else if (effect.is(commitStreamingFinalEffect)) {
+        const segId = effect.value;
+        const next = segments.filter((s) => s.segmentId !== segId);
+        if (next.length !== segments.length) {
+          segments = next;
+          changed = true;
+        }
+      } else if (effect.is(clearAllStreamingEffect)) {
+        if (segments.length > 0) {
+          segments = [];
+          changed = true;
+        }
       }
     }
-    return decorations;
+
+    if (changed || tr.docChanged) {
+      if (segments.length === 0) {
+        return { segments: [], decorations: Decoration.none };
+      }
+      const docLen = tr.state.doc.length;
+      const widget = Decoration.widget({
+        widget: new StreamingTailBlockWidget(segments),
+        side: 1,
+        block: true,
+      });
+      return {
+        segments,
+        decorations: Decoration.set([widget.range(docLen)]),
+      };
+    }
+
+    return value;
   },
-  provide: (f) => EditorView.decorations.from(f),
+  provide: (f) => EditorView.decorations.from(f, (val) => val.decorations),
 });
 
 // -----------------------------------------------------------------------------
@@ -185,14 +240,13 @@ export const DocumentEditor = forwardRef<DocumentEditorHandle, DocumentEditorPro
 
     // 控制器内部状态
     const isComposingRef = useRef<boolean>(false);
-    const pendingTranscriptsRef = useRef<string[]>([]);
+    const pendingTranscriptsRef = useRef<{ segmentId?: string; text: string }[]>([]);
     const isAtBottomRef = useRef<boolean>(true);
     const unreadCountRef = useRef<number>(0);
     const lastUserEditAtRef = useRef<number>(0);
     const tailEditTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-    const hasStreamingPartialRef = useRef<boolean>(false);
 
-    // 人工跳转滚动到文档底部 (带平滑动画)
+    // 人工跳转滚动到文档底部 (平滑动画)
     const scrollToBottom = useCallback(() => {
       const view = editorViewRef.current;
       if (!view) return;
@@ -208,7 +262,7 @@ export const DocumentEditor = forwardRef<DocumentEditorHandle, DocumentEditorPro
       onUnreadCountChangeRef.current?.(0);
     }, []);
 
-    // 流式增量更新时的即时置底 (使用 requestAnimationFrame 合并，绝不使用 smooth 产生黏滞)
+    // 流式增量更新时的即时置底 (requestAnimationFrame 合并置底)
     const instantScrollToBottom = useCallback(() => {
       const view = editorViewRef.current;
       if (!view) return;
@@ -219,22 +273,27 @@ export const DocumentEditor = forwardRef<DocumentEditorHandle, DocumentEditorPro
       });
     }, []);
 
-    // 实际执行队列消费与追加写入
+    // 实际执行队列消费与追加写入 (原子性写入 doc 并移除对应的 ephemeral segment)
     const flushPendingTranscripts = useCallback(() => {
       if (pendingTranscriptsRef.current.length === 0) return;
       const view = editorViewRef.current;
       if (!view) return;
 
-      const textsToInsert = [...pendingTranscriptsRef.current];
+      const itemsToInsert = [...pendingTranscriptsRef.current];
       pendingTranscriptsRef.current = [];
 
-      for (const text of textsToInsert) {
+      for (const item of itemsToInsert) {
         const docLength = view.state.doc.length;
-        const insertText = (docLength > 0 ? '\n\n' : '') + text;
+        const insertText = (docLength > 0 ? '\n\n' : '') + item.text;
 
-        // ASR 自动追加不进入用户 Undo 栈
+        const effects: StateEffect<any>[] = [];
+        if (item.segmentId) {
+          effects.push(commitStreamingFinalEffect.of(item.segmentId));
+        }
+
         view.dispatch({
           changes: { from: docLength, insert: insertText },
+          effects,
           annotations: Transaction.addToHistory.of(false),
           userEvent: 'input.asr',
         });
@@ -287,15 +346,18 @@ export const DocumentEditor = forwardRef<DocumentEditorHandle, DocumentEditorPro
       return isNearTail && isRecentEdit;
     }, []);
 
-    // 渲染实时流式 Partial 视觉投影 (绝不修改 EditorState.doc)
+    // 1. 设置/更新某一段的实时流式 Partial (live 状态)
     const setStreamingPartial = useCallback(
-      (payload: StreamingPartialPayload) => {
+      (segmentId: string, text: string) => {
         const view = editorViewRef.current;
         if (!view) return;
 
-        hasStreamingPartialRef.current = !!payload.text.trim();
         view.dispatch({
-          effects: setStreamingPartialEffect.of(payload),
+          effects: setStreamingPartialEffect.of({
+            segmentId,
+            text,
+            status: 'live',
+          }),
         });
 
         if (isAtBottomRef.current) {
@@ -305,18 +367,54 @@ export const DocumentEditor = forwardRef<DocumentEditorHandle, DocumentEditorPro
       [instantScrollToBottom]
     );
 
-    // 清空流式 Partial 视觉投影
-    const clearStreamingPartial = useCallback(() => {
+    // 2. 封存某一段流式 Partial (停顿结束，等待 Final，光标静止防止闪断)
+    const sealStreamingPartial = useCallback((segmentId: string) => {
       const view = editorViewRef.current;
       if (!view) return;
 
-      hasStreamingPartialRef.current = false;
       view.dispatch({
-        effects: clearStreamingPartialEffect.of(),
+        effects: sealStreamingPartialEffect.of(segmentId),
       });
     }, []);
 
-    // 程序化追加一条定稿转录文本 (Final 到来时调用)
+    // 3. 提交 Final 结果：将该段正式写入文档，同时仅移除该段对应的 ephemeral 投影（不影响正在录音的其他段）
+    const commitStreamingFinal = useCallback(
+      (segmentId: string, finalText: string) => {
+        const trimmed = finalText.trim();
+        if (!trimmed) return;
+
+        const view = editorViewRef.current;
+        if (!view) return;
+
+        // 若正处于 IME 或尾部编辑中，将写入排入队列（在此期间 ephemeral sealed 文本保持显示，0 闪失！）
+        if (isComposingRef.current || isUserActivelyEditingTail(view)) {
+          pendingTranscriptsRef.current.push({ segmentId, text: trimmed });
+          schedulePendingFlushAfterIdle();
+          return;
+        }
+
+        // 正常状态：原子性写入 doc 并清除该段 ephemeral
+        const docLength = view.state.doc.length;
+        const insertText = (docLength > 0 ? '\n\n' : '') + trimmed;
+
+        view.dispatch({
+          changes: { from: docLength, insert: insertText },
+          effects: commitStreamingFinalEffect.of(segmentId),
+          annotations: Transaction.addToHistory.of(false),
+          userEvent: 'input.asr',
+        });
+
+        if (isAtBottomRef.current) {
+          instantScrollToBottom();
+        } else {
+          unreadCountRef.current += 1;
+          onUnreadCountChangeRef.current?.(unreadCountRef.current);
+        }
+      },
+      [instantScrollToBottom, isUserActivelyEditingTail, schedulePendingFlushAfterIdle]
+    );
+
+    // 兼容原有的无 segmentId 的 appendTranscript
     const appendTranscript = useCallback(
       (text: string) => {
         const trimmed = text.trim();
@@ -325,21 +423,12 @@ export const DocumentEditor = forwardRef<DocumentEditorHandle, DocumentEditorPro
         const view = editorViewRef.current;
         if (!view) return;
 
-        // 1. 若处于 IME 中文拼音输入中 -> 排队并进入调度器
-        if (isComposingRef.current) {
-          pendingTranscriptsRef.current.push(trimmed);
+        if (isComposingRef.current || isUserActivelyEditingTail(view)) {
+          pendingTranscriptsRef.current.push({ text: trimmed });
           schedulePendingFlushAfterIdle();
           return;
         }
 
-        // 2. 若用户正处于文档尾部连续打字编辑中 -> 排队并进入调度器
-        if (isUserActivelyEditingTail(view)) {
-          pendingTranscriptsRef.current.push(trimmed);
-          schedulePendingFlushAfterIdle();
-          return;
-        }
-
-        // 3. 正常状态：派发 Transaction 追加
         const docLength = view.state.doc.length;
         const insertText = (docLength > 0 ? '\n\n' : '') + trimmed;
 
@@ -359,6 +448,18 @@ export const DocumentEditor = forwardRef<DocumentEditorHandle, DocumentEditorPro
       [instantScrollToBottom, isUserActivelyEditingTail, schedulePendingFlushAfterIdle]
     );
 
+    // 清空指定或全部流式投影
+    const clearStreamingPartial = useCallback((segmentId?: string) => {
+      const view = editorViewRef.current;
+      if (!view) return;
+
+      if (segmentId) {
+        view.dispatch({ effects: commitStreamingFinalEffect.of(segmentId) });
+      } else {
+        view.dispatch({ effects: clearAllStreamingEffect.of() });
+      }
+    }, []);
+
     // 辅助函数：创建统一配置的 EditorState
     const createNewEditorState = useCallback((content: string) => {
       return EditorState.create({
@@ -369,7 +470,7 @@ export const DocumentEditor = forwardRef<DocumentEditorHandle, DocumentEditorPro
           EditorView.lineWrapping,
           placeholder('等待语音输入，或在此直接打字编辑...'),
           typoraTheme,
-          streamingPartialField,
+          streamingTailField,
           EditorView.updateListener.of((update) => {
             const hasUserInput = update.transactions.some(
               (tr) => tr.isUserEvent('input') || tr.isUserEvent('delete')
@@ -402,7 +503,6 @@ export const DocumentEditor = forwardRef<DocumentEditorHandle, DocumentEditorPro
       }
       pendingTranscriptsRef.current = [];
       unreadCountRef.current = 0;
-      hasStreamingPartialRef.current = false;
       onUnreadCountChangeRef.current?.(0);
 
       const emptyState = createNewEditorState('');
@@ -421,6 +521,8 @@ export const DocumentEditor = forwardRef<DocumentEditorHandle, DocumentEditorPro
       () => ({
         appendTranscript,
         setStreamingPartial,
+        sealStreamingPartial,
+        commitStreamingFinal,
         clearStreamingPartial,
         clearContent,
         getContent,
@@ -429,6 +531,8 @@ export const DocumentEditor = forwardRef<DocumentEditorHandle, DocumentEditorPro
       [
         appendTranscript,
         setStreamingPartial,
+        sealStreamingPartial,
+        commitStreamingFinal,
         clearStreamingPartial,
         clearContent,
         getContent,

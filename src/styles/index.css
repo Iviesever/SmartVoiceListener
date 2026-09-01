@@ -340,6 +340,15 @@ html, body {
   animation: cmPartialFadeIn 0.12s ease-out;
 }
 
+.cm-streaming-segment {
+  display: block;
+  margin-top: 0.6em;
+}
+
+.cm-streaming-segment:first-child {
+  margin-top: 0;
+}
+
 .cm-streaming-text {
   color: #64748b !important;
   transition: color 0.15s ease;

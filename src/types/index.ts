@@ -1,16 +1,23 @@
 export type ListenerState =
   | 'IDLE'                 // 就绪未启动
   | 'LISTENING_SILENCE'    // 正在监听环境音（静默中）
-  | 'SPEAKING_ACTIVE'      // 检测到讲话（流式识别与录制中）
+  | 'SPEAKING_ACTIVE'      // 检测到讲话（流式识别中）
   | 'PAUSE_WAITING'        // 说话短暂停顿（等待判定是否说完）
-  | 'TRANSCRIBING';        // 正在二阶段语音转写中
+  | 'TRANSCRIBING';        // 正在二阶段定稿中
 
-// 实时流式 Partial 视觉投影状态（不进入 Document，仅作 Widget 展示）
-export interface StreamingPartialState {
+// 临时流式分段状态（支持多句重叠与密封状态）
+export interface EphemeralSegment {
+  readonly segmentId: string;
   readonly text: string;
-  readonly segmentId?: string;
-  readonly sessionEpoch?: number;
-  readonly isEnded?: boolean;      // speech_end 后为 true，用于静止光标防闪断
+  readonly status: 'live' | 'sealed'; // 'live' = 呼吸光标, 'sealed' = 停顿静止等待 Final
+}
+
+// 本地音频片段原始缓存（用于 Final 匹配、时间戳校准与降级回放）
+export interface LocalSegmentData {
+  readonly pcm: Float32Array;
+  readonly durationMs: number;
+  readonly startedAt: number;
+  readonly endedAt: number;
 }
 
 // 底层不可变 Segment 数据层（投影到文档，保留原始不可变 ASR 证据）

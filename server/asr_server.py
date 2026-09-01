@@ -136,16 +136,15 @@ class StreamingEngine:
 
 
 # =========================================================================
-# Second-Pass: Offline Recognizer Model Manager
+# Second-Pass: Offline Recognizer Model Manager (模型选择与引擎加载解耦)
 # =========================================================================
 
 class ModelManager:
     def __init__(self):
-        self.active_model_id = "sensevoice-onnx"
+        self.selected_model_id = "sensevoice-onnx"   # 用户选中的默认模型目标
+        self.loaded_engine_model_id = None          # 当前内存中实际装载的模型 ID
         self.current_engine = None
-        self.current_model_id = None
-        self._load_lock = asyncio.Lock()
-        self.load_model(self.active_model_id)
+        self.load_engine(self.selected_model_id)
 
     def get_model_list(self):
         result = []
@@ -158,18 +157,18 @@ class ModelManager:
                     "type": info["type"],
                     "desc": info["desc"],
                     "available": info["path"].exists(),
-                    "isActive": model_id == self.active_model_id,
+                    "isActive": model_id == self.selected_model_id,
                     "gpu": CUDA_AVAILABLE,
                 }
             )
         return result
 
-    def load_model(self, model_id: str):
+    def load_engine(self, model_id: str):
         if model_id not in AVAILABLE_MODELS:
             raise ValueError(f"Unknown model_id: {model_id}")
 
         info = AVAILABLE_MODELS[model_id]
-        if self.current_model_id == model_id and self.current_engine is not None:
+        if self.loaded_engine_model_id == model_id and self.current_engine is not None:
             return
 
         if not info["path"].exists() and not info.get("repo_id"):
@@ -239,8 +238,7 @@ class ModelManager:
                 device_map="cuda:0" if CUDA_AVAILABLE else "cpu",
             )
 
-        self.current_model_id = model_id
-        self.active_model_id = model_id
+        self.loaded_engine_model_id = model_id
         cost_ms = (time.perf_counter() - started) * 1000
 
         if CUDA_AVAILABLE and torch is not None:
@@ -256,7 +254,7 @@ class ModelManager:
         if self.current_engine is None:
             raise RuntimeError("No second-pass model loaded.")
 
-        info = AVAILABLE_MODELS[self.active_model_id]
+        info = AVAILABLE_MODELS[self.loaded_engine_model_id]
 
         if info["engine"] == "sherpa-onnx":
             stream = self.current_engine.create_stream()
@@ -267,7 +265,7 @@ class ModelManager:
         if info["engine"] == "faster-whisper":
             segments, _ = self.current_engine.transcribe(
                 samples,
-                language="zh" if "kotoba" not in self.active_model_id else "ja",
+                language="zh" if "kotoba" not in self.loaded_engine_model_id else "ja",
                 beam_size=1,
                 temperature=0.0,
                 vad_filter=True,
@@ -352,16 +350,13 @@ class OfflineInferenceScheduler:
         async with self.semaphore:
             t0 = time.perf_counter()
             try:
-                # 确保当前模型与 job 请求的模型一致（若切换模型，安全加载）
-                if self.model_mgr.active_model_id != job.model_id:
-                    await asyncio.to_thread(self.model_mgr.load_model, job.model_id)
+                # 确保当前 engine 实例加载了 job 所请求的模型（不覆盖 user selected_model_id）
+                if self.model_mgr.loaded_engine_model_id != job.model_id:
+                    await asyncio.to_thread(self.model_mgr.load_engine, job.model_id)
 
-                # 在后台线程执行推理，防止阻塞 asyncio 事件循环
-                text = await asyncio.wait_for(
-                    asyncio.to_thread(
-                        self.model_mgr.transcribe, job.samples, job.sample_rate
-                    ),
-                    timeout=25.0,
+                # 在后台线程执行推理，不阻塞 asyncio 事件循环
+                text = await asyncio.to_thread(
+                    self.model_mgr.transcribe, job.samples, job.sample_rate
                 )
                 cost_ms = (time.perf_counter() - t0) * 1000
                 final_text = text.strip() if text else job.fallback_text.strip()
@@ -371,7 +366,7 @@ class OfflineInferenceScheduler:
                     session_epoch=job.session_epoch,
                     segment_id=job.segment_id,
                     text=final_text,
-                    model_id=self.model_mgr.active_model_id,
+                    model_id=job.model_id,
                     cost_ms=cost_ms,
                     final_source=source,
                 )
@@ -409,7 +404,7 @@ app.add_middleware(
 
 @app.get("/api/health")
 async def get_health():
-    active_info = AVAILABLE_MODELS.get(model_manager.active_model_id, {})
+    active_info = AVAILABLE_MODELS.get(model_manager.selected_model_id, {})
     vram_info = ""
     if CUDA_AVAILABLE and torch is not None:
         vram_info = f" (GPU VRAM: {torch.cuda.memory_allocated() / 1024**2:.1f}MB)"
@@ -418,7 +413,7 @@ async def get_health():
         "status": "ok",
         "online": True,
         "model": active_info.get("name", "Unknown") + vram_info,
-        "activeModelId": model_manager.active_model_id,
+        "activeModelId": model_manager.selected_model_id,
         "streamingEngineReady": streaming_engine.is_ready,
         "gpu": GPU_NAME if CUDA_AVAILABLE else "CPU",
     }
@@ -428,7 +423,7 @@ async def get_health():
 async def get_models():
     return {
         "models": model_manager.get_model_list(),
-        "activeModelId": model_manager.active_model_id,
+        "activeModelId": model_manager.selected_model_id,
         "gpu": GPU_NAME if CUDA_AVAILABLE else "CPU",
     }
 
@@ -441,14 +436,15 @@ async def post_switch_model(request: Request):
         if not model_id or model_id not in AVAILABLE_MODELS:
             return JSONResponse(status_code=400, content={"error": f"Invalid modelId: {model_id}"})
 
-        # 保护：在 scheduler 的信号量内加载，不抢占正在执行的任务
+        # 保护：更新 selected_model_id 并在 scheduler 信号量内预装载
         async with inference_scheduler.semaphore:
-            await asyncio.to_thread(model_manager.load_model, model_id)
+            model_manager.selected_model_id = model_id
+            await asyncio.to_thread(model_manager.load_engine, model_id)
 
-        active_info = AVAILABLE_MODELS[model_manager.active_model_id]
+        active_info = AVAILABLE_MODELS[model_manager.selected_model_id]
         return {
             "success": True,
-            "activeModelId": model_manager.active_model_id,
+            "activeModelId": model_manager.selected_model_id,
             "modelName": active_info["name"],
         }
     except Exception as exc:
@@ -489,12 +485,19 @@ async def post_legacy_asr(request: Request, file: Optional[UploadFile] = File(No
 
         started = time.perf_counter()
         samples, sample_rate = read_wav_data(wav_bytes)
-        text = await asyncio.to_thread(model_manager.transcribe, samples, sample_rate)
+
+        # 保护：通过 inference_scheduler.semaphore 进行线程与模型隔离保护
+        target_model = model_manager.selected_model_id
+        async with inference_scheduler.semaphore:
+            if model_manager.loaded_engine_model_id != target_model:
+                await asyncio.to_thread(model_manager.load_engine, target_model)
+            text = await asyncio.to_thread(model_manager.transcribe, samples, sample_rate)
+
         cost_ms = (time.perf_counter() - started) * 1000
         duration_sec = len(samples) / sample_rate
 
         print(
-            f"[{model_manager.active_model_id}] Legacy Recognized "
+            f"[{target_model}] Legacy Recognized "
             f"({duration_sec:.2f}s audio in {cost_ms:.1f}ms): {text}"
         )
 
@@ -502,7 +505,7 @@ async def post_legacy_asr(request: Request, file: Optional[UploadFile] = File(No
             "text": text,
             "duration": duration_sec,
             "costMs": cost_ms,
-            "modelId": model_manager.active_model_id,
+            "modelId": target_model,
         }
     except Exception as exc:
         print(f"[!] Legacy ASR Error: {exc}", file=sys.stderr)
@@ -546,7 +549,6 @@ async def websocket_stream_endpoint(ws: WebSocket):
                 }
             )
         except Exception:
-            # 连接可能已断开
             pass
 
     try:
@@ -574,7 +576,7 @@ async def websocket_stream_endpoint(ws: WebSocket):
                             "protocolVersion": 1,
                             "sampleRate": 16000,
                             "streamingReady": streaming_engine.is_ready,
-                            "activeModelId": model_manager.active_model_id,
+                            "activeModelId": model_manager.selected_model_id,
                         }
                     )
 
@@ -592,7 +594,7 @@ async def websocket_stream_endpoint(ws: WebSocket):
 
                     if seg_id == active_segment_id and audio_chunks:
                         sealed_audio = np.concatenate(audio_chunks)
-                        captured_model = model_manager.active_model_id
+                        captured_model = model_manager.selected_model_id
                         job = FinalJob(
                             session_epoch=epoch,
                             segment_id=seg_id,
@@ -611,7 +613,6 @@ async def websocket_stream_endpoint(ws: WebSocket):
                         # 异步调度二阶段推理，不阻塞 WebSocket 接收循环
                         asyncio.create_task(run_and_send_final(job))
                     else:
-                        # 空音频或不匹配的段
                         active_segment_id = None
                         audio_chunks = []
                         stream = streaming_engine.create_stream()
@@ -625,7 +626,7 @@ async def websocket_stream_endpoint(ws: WebSocket):
             # 2. 二进制音频数据帧 (Binary Frame: Float32 PCM 16kHz)
             elif "bytes" in message:
                 raw_bytes = message["bytes"]
-                if not raw_bytes or active_segment_id is None or stream is None:
+                if not raw_bytes or active_segment_id is None:
                     continue
 
                 # 解析 Float32Array PCM
@@ -636,31 +637,32 @@ async def websocket_stream_endpoint(ws: WebSocket):
                 else:
                     continue
 
-                # 1. 紧凑累加到二阶段音频缓存
+                # 1. 永远紧凑累加到二阶段音频缓存 (即便 streaming 引擎不可用也能定稿)
                 audio_chunks.append(samples.copy())
 
-                # 2. 喂入 OnlineRecognizer 增量解码
-                stream.accept_waveform(16000, samples)
-                current_text = streaming_engine.decode_stream(stream)
+                # 2. 若 Streaming 引擎就绪，喂入 OnlineRecognizer 进行增量解码
+                if stream is not None and streaming_engine.is_ready:
+                    stream.accept_waveform(16000, samples)
+                    current_text = streaming_engine.decode_stream(stream)
 
-                if current_text and current_text != last_partial_text:
-                    last_partial_text = current_text
-                    last_revision += 1
-                    await ws.send_json(
-                        {
-                            "type": "partial",
-                            "sessionEpoch": active_session_epoch,
-                            "segmentId": active_segment_id,
-                            "revision": last_revision,
-                            "text": current_text,
-                        }
-                    )
+                    if current_text and current_text != last_partial_text:
+                        last_partial_text = current_text
+                        last_revision += 1
+                        await ws.send_json(
+                            {
+                                "type": "partial",
+                                "sessionEpoch": active_session_epoch,
+                                "segmentId": active_segment_id,
+                                "revision": last_revision,
+                                "text": current_text,
+                            }
+                        )
 
                 # 防御性单段 90 秒最大时长保护
                 total_samples = sum(len(c) for c in audio_chunks)
                 if total_samples >= 16000 * 90:
                     sealed_audio = np.concatenate(audio_chunks)
-                    captured_model = model_manager.active_model_id
+                    captured_model = model_manager.selected_model_id
                     job = FinalJob(
                         session_epoch=active_session_epoch,
                         segment_id=active_segment_id,

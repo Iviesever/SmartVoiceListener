@@ -5,6 +5,7 @@ import {
   ServerPartialEvent,
   ServerFinalEvent,
   ServerErrorEvent,
+  LocalSegmentData,
 } from '../types';
 import { DEFAULT_ASR_PORT } from './asrService';
 
@@ -35,6 +36,11 @@ export class PrefixRingBuffer {
   public reset(capacity = 12800) {
     this.capacity = capacity;
     this.buffer = new Float32Array(capacity);
+    this.writePos = 0;
+    this.size = 0;
+  }
+
+  public clear() {
     this.writePos = 0;
     this.size = 0;
   }
@@ -98,9 +104,11 @@ export class StreamingTransport {
   private ws: WebSocket | null = null;
   private wsUrl: string;
   private isConnected = false;
+  private isIntentionalClose = false;
+  private reconnectAttempts = 0;
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
 
-  public onStreamReady?: (sampleRate: number) => void;
+  public onStreamReady?: (sampleRate: number, streamingReady: boolean) => void;
   public onPartial?: (event: ServerPartialEvent) => void;
   public onFinal?: (event: ServerFinalEvent) => void;
   public onError?: (event: ServerErrorEvent) => void;
@@ -119,11 +127,26 @@ export class StreamingTransport {
   }
 
   public connect(): Promise<void> {
+    this.isIntentionalClose = false;
+    if (this.reconnectTimer) {
+      clearTimeout(this.reconnectTimer);
+      this.reconnectTimer = null;
+    }
+
     return new Promise((resolve) => {
       if (this.ws && (this.ws.readyState === WebSocket.OPEN || this.ws.readyState === WebSocket.CONNECTING)) {
         resolve();
         return;
       }
+
+      let resolved = false;
+      const timeoutTimer = setTimeout(() => {
+        if (!resolved) {
+          resolved = true;
+          console.warn('[WS] Connect timeout (4s), will fallback/retry in background');
+          resolve();
+        }
+      }, 4000);
 
       try {
         this.ws = new WebSocket(this.wsUrl);
@@ -131,6 +154,7 @@ export class StreamingTransport {
 
         this.ws.onopen = () => {
           this.isConnected = true;
+          this.reconnectAttempts = 0;
           this.onConnectionChange?.(true);
           console.log('[WS] Connected to Streaming ASR server:', this.wsUrl);
 
@@ -143,7 +167,12 @@ export class StreamingTransport {
             format: 'f32le',
             packetSamples: 1600,
           });
-          resolve();
+
+          if (!resolved) {
+            resolved = true;
+            clearTimeout(timeoutTimer);
+            resolve();
+          }
         };
 
         this.ws.onmessage = (e) => {
@@ -151,7 +180,7 @@ export class StreamingTransport {
             try {
               const event: ServerStreamingEvent = JSON.parse(e.data);
               if (event.type === 'stream_ready') {
-                this.onStreamReady?.(event.sampleRate);
+                this.onStreamReady?.(event.sampleRate, event.streamingReady);
               } else if (event.type === 'partial') {
                 this.onPartial?.(event);
               } else if (event.type === 'final') {
@@ -167,18 +196,47 @@ export class StreamingTransport {
 
         this.ws.onerror = (e) => {
           console.warn('[WS] WebSocket error:', e);
+          if (!resolved) {
+            resolved = true;
+            clearTimeout(timeoutTimer);
+            resolve();
+          }
         };
 
         this.ws.onclose = () => {
           this.isConnected = false;
           this.onConnectionChange?.(false);
           console.log('[WS] WebSocket connection closed');
+
+          if (!this.isIntentionalClose) {
+            this.scheduleReconnect();
+          }
+
+          if (!resolved) {
+            resolved = true;
+            clearTimeout(timeoutTimer);
+            resolve();
+          }
         };
       } catch (err) {
-        console.warn('[WS] Failed to connect WebSocket:', err);
-        resolve();
+        console.warn('[WS] Failed to create WebSocket:', err);
+        if (!resolved) {
+          resolved = true;
+          clearTimeout(timeoutTimer);
+          resolve();
+        }
       }
     });
+  }
+
+  private scheduleReconnect() {
+    if (this.isIntentionalClose) return;
+    this.reconnectAttempts++;
+    const delay = Math.min(5000, 1000 * Math.pow(1.5, this.reconnectAttempts - 1));
+    console.log(`[WS] Scheduling reconnect in ${delay}ms (attempt #${this.reconnectAttempts})...`);
+    this.reconnectTimer = setTimeout(() => {
+      void this.connect();
+    }, delay);
   }
 
   public sendMessage(msg: ClientStreamMessage) {
@@ -189,12 +247,12 @@ export class StreamingTransport {
 
   public sendBinaryPcm(samples: Float32Array) {
     if (this.ws && this.ws.readyState === WebSocket.OPEN) {
-      // 保持 Float32Array 紧凑二进制传输 (4 字节/采样)
       this.ws.send(samples.buffer);
     }
   }
 
   public disconnect() {
+    this.isIntentionalClose = true;
     if (this.reconnectTimer) {
       clearTimeout(this.reconnectTimer);
       this.reconnectTimer = null;
@@ -244,17 +302,17 @@ export class AudioCaptureEngine {
   private consecutiveSpeechFrames = 0;
   private consecutiveSilenceFrames = 0;
 
-  // 本地录音片段缓存 (直到收到 Final ACK 才清除，用于降级与回放)
+  // 本地录音片段缓存 (保留完整时间戳与 Float32 PCM，用于 Final 回调与降级)
   private currentSegmentPcmChunks: Float32Array[] = [];
-  public readonly localSegmentCache = new Map<string, { pcm: Float32Array; durationMs: number; createdAt: number }>();
+  public readonly localSegmentCache = new Map<string, LocalSegmentData>();
 
   // 外部回调
   public onSpeakingStart?: (segmentId: string) => void;
   public onSpeakingPause?: (remainingMs: number) => void;
-  public onSpeakingEnd?: (segmentId: string, pcm: Float32Array, durationMs: number) => void;
+  public onSpeakingEnd?: (segmentId: string, durationMs: number) => void;
   public onVolumeUpdate?: (volume: number, isSpeech: boolean, noiseFloor: number) => void;
   public onPartial?: (event: ServerPartialEvent) => void;
-  public onFinal?: (event: ServerFinalEvent) => void;
+  public onFinal?: (event: ServerFinalEvent, cachedData?: LocalSegmentData) => void;
   public onError?: (event: ServerErrorEvent) => void;
 
   constructor(config: VadConfig = DEFAULT_VAD_CONFIG) {
@@ -268,11 +326,12 @@ export class AudioCaptureEngine {
     };
 
     this.transport.onFinal = (event) => {
-      // 收到 Final ACK，安全清理本地暂存
-      this.localSegmentCache.delete(event.segmentId);
+      // 关键修复：先获取 cachedData 传给回调，再清理 localSegmentCache
+      const cached = this.localSegmentCache.get(event.segmentId);
       if (event.sessionEpoch === this.currentSessionEpoch) {
-        this.onFinal?.(event);
+        this.onFinal?.(event, cached);
       }
+      this.localSegmentCache.delete(event.segmentId);
     };
 
     this.transport.onError = (event) => {
@@ -286,8 +345,32 @@ export class AudioCaptureEngine {
     this.prefixRing.reset(ringCapacity);
   }
 
-  public setSessionEpoch(epoch: number) {
-    this.currentSessionEpoch = epoch;
+  /**
+   * 原子重置会话世代 (在点击清空文档或重置工作区时调用，复用同一个麦克风时钟)
+   */
+  public resetSession(newEpoch: number) {
+    // 1. 若当前有未完结的说话段，发送 cancel
+    if (this.isSpeaking && this.activeSegmentId) {
+      this.transport.sendMessage({
+        type: 'speech_cancel',
+        sessionEpoch: this.currentSessionEpoch,
+        segmentId: this.activeSegmentId,
+      });
+    }
+
+    // 2. 原子重置所有状态与缓冲
+    this.isSpeaking = false;
+    this.activeSegmentId = null;
+    this.speechStartMs = 0;
+    this.silenceStartMs = 0;
+    this.consecutiveSpeechFrames = 0;
+    this.consecutiveSilenceFrames = 0;
+    this.prefixRing.clear();
+    this.currentSegmentPcmChunks = [];
+    this.localSegmentCache.clear();
+
+    // 3. 更新为最新世代
+    this.currentSessionEpoch = newEpoch;
   }
 
   public async start(epoch: number): Promise<void> {
@@ -327,7 +410,6 @@ export class AudioCaptureEngine {
     this.analyser = this.audioContext.createAnalyser();
     this.analyser.fftSize = 512;
 
-    // 采集帧大小：2048 采样（在 16kHz 下约 128ms，若 48kHz 下约 42ms）
     const bufferSize = 2048;
     this.scriptProcessor = this.audioContext.createScriptProcessor(bufferSize, 1, 1);
 
@@ -370,9 +452,6 @@ export class AudioCaptureEngine {
     this.onVolumeUpdate?.(rms, this.isSpeaking, this.noiseFloor);
 
     if (!this.isSpeaking) {
-      // 维护 800ms 前缀快照环
-      this.prefixRing.write(chunk);
-
       if (isSpeechFrame) {
         this.consecutiveSpeechFrames++;
         if (this.consecutiveSpeechFrames >= 2) {
@@ -386,16 +465,20 @@ export class AudioCaptureEngine {
           const segId = `seg-${now}-${Math.random().toString(36).substring(2, 7)}`;
           this.activeSegmentId = segId;
 
+          // 关键修复 P0-1：先快照开口前的 RingBuffer，然后立即清空 RingBuffer，最后发 trigger chunk
+          // 确保每个采样只属于该 Segment 一次，绝对零重复！
+          const prefixSnapshot = this.prefixRing.snapshot();
+          this.prefixRing.clear();
+
           // 1. 发送 speech_start 控制帧
           this.transport.sendMessage({
             type: 'speech_start',
             sessionEpoch: this.currentSessionEpoch,
             segmentId: segId,
-            hasPrefix: true,
+            hasPrefix: prefixSnapshot.length > 0,
           });
 
-          // 2. 立即将 800ms 前缀快照作为首包 Binary Frame 发送
-          const prefixSnapshot = this.prefixRing.snapshot();
+          // 2. 发送前缀快照 (若有)
           if (prefixSnapshot.length > 0) {
             this.transport.sendBinaryPcm(prefixSnapshot);
             this.currentSegmentPcmChunks = [prefixSnapshot, chunk];
@@ -403,13 +486,16 @@ export class AudioCaptureEngine {
             this.currentSegmentPcmChunks = [chunk];
           }
 
-          // 3. 发送当前触发帧
+          // 3. 发送当前触发帧 chunk
           this.transport.sendBinaryPcm(chunk);
 
           this.onSpeakingStart?.(segId);
+          return;
         }
       } else {
         this.consecutiveSpeechFrames = 0;
+        // 仅在非触发状态下将环境音频写入 RingBuffer
+        this.prefixRing.write(chunk);
       }
       return;
     }
@@ -449,10 +535,14 @@ export class AudioCaptureEngine {
   private finalizeSpeechSegment() {
     this.isSpeaking = false;
     const segId = this.activeSegmentId;
+    const startMs = this.speechStartMs;
+    const now = Date.now();
+
     this.activeSegmentId = null;
     this.silenceStartMs = 0;
     this.consecutiveSpeechFrames = 0;
     this.consecutiveSilenceFrames = 0;
+    this.prefixRing.clear(); // 关键修复：切段时清空前缀环，防止残留污染下一段
 
     if (!segId || this.currentSegmentPcmChunks.length === 0) return;
 
@@ -482,7 +572,15 @@ export class AudioCaptureEngine {
 
     // 过滤掉低于 450ms 的短促冲击杂音
     if (durationMs >= 450) {
-      // 1. 发送 speech_end 通知后端触发 Second-Pass 定稿
+      // 1. 本地缓存该段 PCM 与精准起止时间
+      this.localSegmentCache.set(segId, {
+        pcm: mergedPcm,
+        durationMs,
+        startedAt: startMs,
+        endedAt: now,
+      });
+
+      // 2. 发送 speech_end 通知后端触发 Second-Pass 定稿
       this.transport.sendMessage({
         type: 'speech_end',
         sessionEpoch: this.currentSessionEpoch,
@@ -490,16 +588,8 @@ export class AudioCaptureEngine {
         durationMs,
       });
 
-      // 2. 本地缓存该段 PCM（用于 Final 到来时生成 WAV 播放，或网络异常时重试）
-      this.localSegmentCache.set(segId, {
-        pcm: mergedPcm,
-        durationMs,
-        createdAt: Date.now(),
-      });
-
-      this.onSpeakingEnd?.(segId, mergedPcm, durationMs);
+      this.onSpeakingEnd?.(segId, durationMs);
     } else {
-      // 杂音段发送 cancel
       this.transport.sendMessage({
         type: 'speech_cancel',
         sessionEpoch: this.currentSessionEpoch,
@@ -538,6 +628,8 @@ export class AudioCaptureEngine {
     this.currentSegmentPcmChunks = [];
     this.activeSegmentId = null;
     this.isSpeaking = false;
+    this.prefixRing.clear();
+    this.localSegmentCache.clear();
   }
 }
 

@@ -35,11 +35,14 @@ if (!existsSync(nodeModulesPath)) {
   console.log(green('[成功] 前端依赖安装完成！\n'));
 }
 
-// 2. 检查模型文件
+// 2. 检查模型文件完整性 (Silero VAD, SenseVoice, Streaming Paraformer)
 const modelsDir = resolve(rootDir, 'models');
 const vadModel = resolve(modelsDir, 'silero_vad.onnx');
-if (!existsSync(vadModel)) {
-  console.log(yellow('[提示] 未检测到离线模型文件，正在自动拉取模型...'));
+const sensevoiceModel = resolve(modelsDir, 'sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17', 'model.int8.onnx');
+const paraformerModel = resolve(modelsDir, 'sherpa-onnx-streaming-paraformer-bilingual-zh-en', 'encoder.int8.onnx');
+
+if (!existsSync(vadModel) || !existsSync(sensevoiceModel) || !existsSync(paraformerModel)) {
+  console.log(yellow('[提示] 检测到模型文件不完整，正在自动补全/拉取模型...'));
   const pyCmd = isWin ? 'python' : 'python3';
   spawnSync(pyCmd, ['download_models.py'], { cwd: rootDir, stdio: 'inherit' });
 }
