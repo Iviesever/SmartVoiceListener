@@ -181,6 +181,7 @@ class ModelManager:
         started = time.perf_counter()
 
         self.current_engine = None
+        self.loaded_engine_model_id = None
         gc.collect()
         if CUDA_AVAILABLE and torch is not None:
             torch.cuda.empty_cache()
@@ -436,10 +437,20 @@ async def post_switch_model(request: Request):
         if not model_id or model_id not in AVAILABLE_MODELS:
             return JSONResponse(status_code=400, content={"error": f"Invalid modelId: {model_id}"})
 
-        # 保护：在 scheduler 信号量内先装载，装载成功后才 commit 更新 selected_model_id
+        previous_model = model_manager.selected_model_id
+
+        # 保护：在 scheduler 信号量内先装载；若发生异常自动回滚重载 previous_model
         async with inference_scheduler.semaphore:
-            await asyncio.to_thread(model_manager.load_engine, model_id)
-            model_manager.selected_model_id = model_id
+            try:
+                await asyncio.to_thread(model_manager.load_engine, model_id)
+                model_manager.selected_model_id = model_id
+            except Exception as exc:
+                print(f"[!] Failed to switch model to {model_id}, rolling back to {previous_model}: {exc}", file=sys.stderr)
+                try:
+                    await asyncio.to_thread(model_manager.load_engine, previous_model)
+                except Exception as rb_err:
+                    print(f"[!] Rollback to {previous_model} failed: {rb_err}", file=sys.stderr)
+                raise exc
 
         active_info = AVAILABLE_MODELS[model_manager.selected_model_id]
         return {

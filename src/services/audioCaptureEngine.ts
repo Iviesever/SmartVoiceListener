@@ -299,6 +299,7 @@ export class AudioCaptureEngine {
   private startedConnectionGeneration = 0;
   private isSpeaking = false;
   private speechStartMs = 0;
+  private lastSpeechEvidenceAt = 0; // 记录最近一次非静音/人声采样点的时间戳
   private silenceStartMs = 0;
 
   // 自适应动态底噪基线
@@ -360,7 +361,7 @@ export class AudioCaptureEngine {
 
   /**
    * 原子性认领一个 segmentId 的 Final 结算权 (Exactly-Once Settlement)
-   * 无论来自 WebSocket Final 还是 HTTP Fallback，只有第一个认领者能成功并获得 cachedData
+   * 无论来自 WebSocket Final 还是 HTTP Fallback，只有第一个成功者能认领并获得 cachedData
    */
   private claimSegmentForFinal(segmentId: string): LocalSegmentData | undefined {
     const cached = this.localSegmentCache.get(segmentId);
@@ -408,6 +409,7 @@ export class AudioCaptureEngine {
     this.isSpeaking = false;
     this.activeSegmentId = null;
     this.speechStartMs = 0;
+    this.lastSpeechEvidenceAt = 0;
     this.silenceStartMs = 0;
     this.consecutiveSpeechFrames = 0;
     this.consecutiveSilenceFrames = 0;
@@ -509,6 +511,7 @@ export class AudioCaptureEngine {
         // 确认开口说话 (第 2 帧确认)
         this.isSpeaking = true;
         this.speechStartMs = now;
+        this.lastSpeechEvidenceAt = now;
         this.silenceStartMs = 0;
         this.consecutiveSpeechFrames = 0;
         this.consecutiveSilenceFrames = 0;
@@ -554,6 +557,10 @@ export class AudioCaptureEngine {
     this.currentSegmentPcmChunks.push(chunk);
     this.transport.sendBinaryPcm(chunk);
 
+    if (isSpeechFrame) {
+      this.lastSpeechEvidenceAt = now;
+    }
+
     // 单段最大时长硬保护 (前端 90s 主控切段)
     if (now - this.speechStartMs >= this.config.maxSpeechDurationMs) {
       this.finalizeSpeechSegment();
@@ -586,6 +593,7 @@ export class AudioCaptureEngine {
     this.isSpeaking = false;
     const segId = this.activeSegmentId;
     const startMs = this.speechStartMs;
+    const lastEvidence = this.lastSpeechEvidenceAt;
     const now = Date.now();
 
     this.activeSegmentId = null;
@@ -619,11 +627,12 @@ export class AudioCaptureEngine {
 
     const durationMs = Math.round((totalLength / 16000) * 1000);
     const audioStartedAt = now - durationMs;
-    const activeDurationMs = now - startMs;
+    // 关键优化：真正的人声证据净时长 (从 startMs 到最后一次非静音采样点的时间)
+    const speechEvidenceDurationMs = lastEvidence > 0 ? lastEvidence - startMs : 0;
     this.currentSegmentPcmChunks = [];
 
-    // 关键修复：用真正活跃讲话净时长过滤低于 450ms 的短促冲击杂音
-    if (activeDurationMs >= 450) {
+    // 真正人声证据净时长 >= 450ms 才判定为有效语音，过滤短瞬态冲击杂音
+    if (speechEvidenceDurationMs >= 450) {
       // 1. 本地缓存该段 PCM 与精准起止时间
       this.localSegmentCache.set(segId, {
         pcm: mergedPcm,
@@ -647,17 +656,17 @@ export class AudioCaptureEngine {
           durationMs,
         });
 
-        // 15秒看门狗保护：若 WS 长时间未回包，自动触发 HTTP Fallback 挽救该段
+        // 15秒看门狗保护：若 WS 长时间未回包，自动触发 HTTP Fallback 挽救该段 (mode: 'ws-watchdog')
         const watchdog = setTimeout(() => {
           if (this.localSegmentCache.has(segId)) {
-            console.warn(`[ASR] WS final timeout (15s) for ${segId}, triggering HTTP fallback...`);
-            void this.executeHttpFallback(segId, mergedPcm, durationMs, audioStartedAt, now);
+            console.warn(`[ASR] WS final timeout (15s) for ${segId}, triggering HTTP fallback (ws-watchdog)...`);
+            void this.executeHttpFallback(segId, mergedPcm, durationMs, audioStartedAt, now, 'ws-watchdog');
           }
         }, 15000);
         this.segmentWatchdogs.set(segId, watchdog);
       } else {
-        console.warn(`[ASR] Transport disconnected or reconnected mid-speech for ${segId}, immediately fallback to HTTP...`);
-        void this.executeHttpFallback(segId, mergedPcm, durationMs, audioStartedAt, now);
+        console.warn(`[ASR] Transport disconnected or reconnected mid-speech for ${segId}, immediately fallback to HTTP (ws-unavailable)...`);
+        void this.executeHttpFallback(segId, mergedPcm, durationMs, audioStartedAt, now, 'ws-unavailable');
       }
     } else {
       if (this.transport.ready) {
@@ -675,13 +684,14 @@ export class AudioCaptureEngine {
     pcm: Float32Array,
     durationMs: number,
     startedAt: number,
-    endedAt: number
+    endedAt: number,
+    mode: 'ws-watchdog' | 'ws-unavailable'
   ) {
     try {
       const wavBlob = pcmToWavBlob(pcm, 16000);
       const res = await transcribeAudioBlob(wavBlob);
 
-      // 关键修复 Blocker: 原子认领 Final 结算权
+      // 关键修复 Blocker: 原子认领 Final 结算权 (只有第一个成功者能认领)
       const cached = this.claimSegmentForFinal(segId);
       if (!cached) {
         // WS Final 已经抢先一步完成结算并落库
@@ -708,14 +718,25 @@ export class AudioCaptureEngine {
         segmentData
       );
     } catch (err) {
-      console.error(`[ASR] HTTP fallback failed for segment ${segId}:`, err);
+      console.error(`[ASR] HTTP fallback failed for segment ${segId} (mode: ${mode}):`, err);
+
+      // 关键 Blocker 修复：
+      // 若当前处于 ws-watchdog 模式，说明 WS Second-Pass 仍在后端排队执行，
+      // 绝不能 claim/delete 掉 localSegmentCache！保留缓存继续等待迟到的 WS Final。
+      if (mode === 'ws-watchdog') {
+        console.warn(`[ASR] Retaining local segment cache for ${segId} in case late WS Final arrives`);
+        return;
+      }
+
+      // 若处于 ws-unavailable 模式（WS 彻底未连或 mid-speech 重连无上下文），
+      // 则说明不会有任何 WS Final 到达，此时才正式 settle error 并清理缓存。
       const cached = this.claimSegmentForFinal(segId);
       if (cached) {
         this.onError?.({
           type: 'error',
           sessionEpoch: this.currentSessionEpoch,
           segmentId: segId,
-          message: 'HTTP Fallback failed',
+          message: 'HTTP Fallback failed and WebSocket unavailable',
         });
       }
     }
@@ -754,6 +775,7 @@ export class AudioCaptureEngine {
     this.currentSegmentPcmChunks = [];
     this.activeSegmentId = null;
     this.isSpeaking = false;
+    this.lastSpeechEvidenceAt = 0;
     this.prefixRing.clear();
     this.localSegmentCache.clear();
   }

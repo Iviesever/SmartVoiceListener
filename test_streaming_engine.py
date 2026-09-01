@@ -29,7 +29,7 @@ def load_test_audio():
 
 
 # =========================================================================
-# 1. 验证 Streaming Paraformer 引擎增量吐字与首字延迟 (time_to_first_partial)
+# 1. 验证 Streaming Paraformer 引擎增量吐字与首字音频位置 (First Token Audio Lookahead)
 # =========================================================================
 def test_streaming_engine_direct():
     print("\n--- 1. Testing Streaming Paraformer Online Engine & Latency ---")
@@ -43,26 +43,26 @@ def test_streaming_engine_direct():
     
     chunk_size = 1600
     partials = []
-    time_to_first_partial = None
+    time_to_first_partial_audio_ms = None
     t0 = time.perf_counter()
     for i in range(0, len(samples), chunk_size):
         chunk = samples[i:i+chunk_size]
         stream.accept_waveform(sample_rate, chunk)
         text = streaming_engine.decode_stream(stream)
         if text and (not partials or text != partials[-1]):
-            if time_to_first_partial is None:
-                time_to_first_partial = (i + len(chunk)) / sample_rate * 1000
+            if time_to_first_partial_audio_ms is None:
+                time_to_first_partial_audio_ms = (i + len(chunk)) / sample_rate * 1000
             partials.append(text)
             print(f"  -> Partial @ {(i+len(chunk))/sample_rate:.2f}s: \"{text}\"")
 
     cost_ms = (time.perf_counter() - t0) * 1000
     print(f"[✓] Streaming Paraformer finished in {cost_ms:.1f}ms (RTF: {cost_ms/(len(samples)/sample_rate*1000):.3f}), final partial: \"{partials[-1] if partials else ''}\"")
-    print(f"[✓] Time to first partial token: {time_to_first_partial:.1f}ms of audio")
+    print(f"[✓] First Partial token emerged at audio offset: {time_to_first_partial_audio_ms:.1f}ms")
     assert len(partials) > 0, "Should have produced at least one partial transcription"
 
 
 # =========================================================================
-# 2. 验证模型切换与 Second-Pass 调度隔离 & 失败回滚保护
+# 2. 验证模型切换与 Second-Pass 调度隔离 & 失败回滚恢复保护
 # =========================================================================
 async def test_scheduler_model_isolation():
     print("\n--- 2. Testing OfflineInferenceScheduler & Model Isolation / Rollback ---")
@@ -105,7 +105,7 @@ async def test_scheduler_model_isolation():
     assert model_manager.selected_model_id == user_target
     print(f"  [✓] Model isolation verified: Job executed and user selected_model_id={model_manager.selected_model_id} preserved!")
 
-    # 核心验证 2：加载不存在模型时，selected_model_id 不会被破坏
+    # 核心验证 2：加载失败时，selected_model_id 不会被破坏，且原引擎正常可用
     client = TestClient(app)
     res = client.post("/api/switch_model", json={"modelId": "non-existent-model"})
     assert res.status_code == 400
@@ -290,10 +290,10 @@ def test_prefix_ring_continuity_and_no_drop():
 
 
 # =========================================================================
-# 6. 验证 Exactly-Once Final Settlement 竞态模拟
+# 6. 验证 Exactly-Once 结算与 Watchdog Fallback 失败保护
 # =========================================================================
-def test_exactly_once_settlement_simulation():
-    print("\n--- 6. Testing Exactly-Once Final Settlement Race Simulation ---")
+def test_exactly_once_settlement_and_watchdog_failure_protection():
+    print("\n--- 6. Testing Exactly-Once Settlement & Watchdog Fallback Failure Protection ---")
     local_cache = {"seg-001": {"pcm": np.zeros(16000), "durationMs": 1000}}
     commit_history = []
 
@@ -303,26 +303,45 @@ def test_exactly_once_settlement_simulation():
             return data
         return None
 
-    def on_final_callback(source: str, segment_id: str, text: str):
-        data = claim_segment_for_final(segment_id)
-        if data is None:
-            # 迟到的竞态包被安全忽略
+    def execute_http_fallback(segment_id: str, will_succeed: bool, mode: str):
+        if will_succeed:
+            cached = claim_segment_for_final(segment_id)
+            if cached is not None:
+                commit_history.append(("HTTP_SUCCESS", segment_id, "HTTP转录结果"))
+                return True
+        else:
+            # 关键验证：若为 ws-watchdog 模式，失败时不 claim，保留缓存给迟到的 WS Final！
+            if mode == "ws-watchdog":
+                return False
+            # 若为 ws-unavailable 模式，则 claim 并报错
+            cached = claim_segment_for_final(segment_id)
+            if cached is not None:
+                commit_history.append(("HTTP_ERROR", segment_id, "ERROR"))
             return False
-        commit_history.append((source, segment_id, text))
+
+    def on_ws_final(segment_id: str, text: str):
+        cached = claim_segment_for_final(segment_id)
+        if cached is None:
+            # 已经被抢先认领
+            return False
+        commit_history.append(("WS_SUCCESS", segment_id, text))
         return True
 
-    # 场景：HTTP Fallback 先成功返回并提交
-    success1 = on_final_callback("HTTP_FALLBACK", "seg-001", "第一句话(HTTP)")
-    assert success1 is True
+    # 场景 1：15s watchdog 触发 HTTP fallback，但 fallback 异常/超时失败了 (mode: 'ws-watchdog')
+    fallback_ok = execute_http_fallback("seg-001", will_succeed=False, mode="ws-watchdog")
+    assert fallback_ok is False
+    # 验证：本地缓存依然被完好保留！
+    assert "seg-001" in local_cache
 
-    # 稍后迟到的 WS Final 尝试提交同一个 segment_id
-    success2 = on_final_callback("WS_FINAL", "seg-001", "第一句话(WS)")
-    assert success2 is False
+    # 随后在 t=30s 时迟到的 WS Qwen Final 终于到达
+    ws_ok = on_ws_final("seg-001", "迟到但成功的WS定稿文本")
+    assert ws_ok is True
+    assert "seg-001" not in local_cache
 
-    # 核心验证：commit 历史中恰好只有 1 条记录，绝对零双写！
+    # 验证结果：迟到的主通道 WS Final 成功被落库，绝对没有被失败的备用通道破坏！
     assert len(commit_history) == 1
-    assert commit_history[0][0] == "HTTP_FALLBACK"
-    print(f"[✓] Exactly-once settlement verified: 2 concurrent channels yielded exactly 1 commit: {commit_history[0]}")
+    assert commit_history[0][0] == "WS_SUCCESS"
+    print(f"[✓] Watchdog fallback failure protection verified: Late WS Final succeeded -> {commit_history[0]}")
 
 
 def main():
@@ -331,7 +350,7 @@ def main():
     test_websocket_stream_e2e()
     test_streaming_unavailable_degradation()
     test_prefix_ring_continuity_and_no_drop()
-    test_exactly_once_settlement_simulation()
+    test_exactly_once_settlement_and_watchdog_failure_protection()
     print("\n[★] ALL 6 REGRESSION TEST SUITES PASSED SUCCESSFULLY!\n")
 
 
