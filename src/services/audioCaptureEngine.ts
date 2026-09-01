@@ -302,8 +302,9 @@ export class AudioCaptureEngine {
   private speechEvidenceSamples = 0;
   private hasReceivedPartialForActiveSegment = false;
 
-  // 当前用户选择的模型 (冻结到各个 segment)
+  // 当前用户选择的模型与当前段冻结的模型 (P1-1: Production Model Freeze)
   public activeModelId = 'sensevoice-onnx';
+  private activeSegmentModelId: string | null = null;
 
   // 自适应动态底噪基线
   private noiseFloor = 0.005;
@@ -311,10 +312,13 @@ export class AudioCaptureEngine {
   private consecutiveSpeechFrames = 0;
   private consecutiveSilenceFrames = 0;
 
-  // 本地录音片段缓存 (保留完整时间戳与 Float32 PCM，用于 Final 回调与故障恢复)
+  // 本地录音片段缓存与定时器 (P0-3: 15s Watchdog + 60s Absolute Settlement Deadline)
   private currentSegmentPcmChunks: Float32Array[] = [];
   public readonly localSegmentCache = new Map<string, LocalSegmentData>();
-  private readonly segmentWatchdogs = new Map<string, ReturnType<typeof setTimeout>>();
+  private readonly segmentTimers = new Map<
+    string,
+    { watchdog?: ReturnType<typeof setTimeout>; deadline?: ReturnType<typeof setTimeout> }
+  >();
 
   // 外部回调
   public onSpeakingStart?: (segmentId: string) => void;
@@ -355,8 +359,7 @@ export class AudioCaptureEngine {
     this.transport.onFinal = (event) => {
       const trimmed = event.text ? event.text.trim() : '';
       if (!trimmed) {
-        // 空 Final 不当作成功认领，触发 fallback
-        console.warn(`[ASR] Received empty Final for ${event.segmentId}, routing to fallback/cancel`);
+        console.warn(`[ASR] Received empty Final for ${event.segmentId}, routing to fallback`);
         const cached = this.localSegmentCache.get(event.segmentId);
         if (cached) {
           void this.executeHttpFallback(
@@ -365,7 +368,7 @@ export class AudioCaptureEngine {
             cached.durationMs,
             cached.startedAt,
             cached.endedAt,
-            'ws-watchdog',
+            'ws-unavailable',
             cached.modelId
           );
         }
@@ -383,14 +386,29 @@ export class AudioCaptureEngine {
       }
     };
 
+    // 关键修复 P0-4: Server Segment Error 先由 Engine 处理降级，不直接导致状态源分裂
     this.transport.onError = (event) => {
+      if (event.segmentId && this.localSegmentCache.has(event.segmentId)) {
+        const cached = this.localSegmentCache.get(event.segmentId)!;
+        console.warn(`[ASR] Received server error for ${event.segmentId}, routing to terminal HTTP fallback...`);
+        void this.executeHttpFallback(
+          event.segmentId,
+          cached.pcm,
+          cached.durationMs,
+          cached.startedAt,
+          cached.endedAt,
+          'ws-unavailable',
+          cached.modelId
+        );
+        return;
+      }
       this.onError?.(event);
     };
   }
 
   /**
    * 原子性认领一个 segmentId 的 Final 结算权 (Exactly-Once Settlement)
-   * 无论来自 WebSocket Final 还是 HTTP Fallback，只有第一个成功者能认领并获得 cachedData
+   * 成功认领时必须同时清理 watchdog 和 60s 绝对终结 deadline 定时器
    */
   public claimSegmentForFinal(segmentId: string): LocalSegmentData | undefined {
     const cached = this.localSegmentCache.get(segmentId);
@@ -401,11 +419,12 @@ export class AudioCaptureEngine {
     // 立即删除缓存，阻断后续任何竞争通道
     this.localSegmentCache.delete(segmentId);
 
-    // 清除看门狗定时器
-    const timer = this.segmentWatchdogs.get(segmentId);
-    if (timer) {
-      clearTimeout(timer);
-      this.segmentWatchdogs.delete(segmentId);
+    // 清除看门狗与绝对终结定时器
+    const timers = this.segmentTimers.get(segmentId);
+    if (timers) {
+      if (timers.watchdog) clearTimeout(timers.watchdog);
+      if (timers.deadline) clearTimeout(timers.deadline);
+      this.segmentTimers.delete(segmentId);
     }
 
     // 若采集已停止且所有在飞段落已全部定稿结算完毕，优雅关闭网络传输
@@ -437,9 +456,12 @@ export class AudioCaptureEngine {
       this.onSpeakingCancel?.(segId);
     }
 
-    // 2. 清理所有看门狗定时器并通知 UI 释放所有未定稿 ephemeral 投影
-    this.segmentWatchdogs.forEach((t) => clearTimeout(t));
-    this.segmentWatchdogs.clear();
+    // 2. 清理所有看门狗与 deadline 定时器，并通知 UI 释放所有未定稿 ephemeral 投影
+    this.segmentTimers.forEach((t) => {
+      if (t.watchdog) clearTimeout(t.watchdog);
+      if (t.deadline) clearTimeout(t.deadline);
+    });
+    this.segmentTimers.clear();
 
     const pendingIds = Array.from(this.localSegmentCache.keys());
     for (const segId of pendingIds) {
@@ -449,6 +471,7 @@ export class AudioCaptureEngine {
     // 3. 原子重置所有状态与缓冲
     this.isSpeaking = false;
     this.activeSegmentId = null;
+    this.activeSegmentModelId = null;
     this.speechStartMs = 0;
     this.speechEvidenceSamples = 0;
     this.hasReceivedPartialForActiveSegment = false;
@@ -562,6 +585,8 @@ export class AudioCaptureEngine {
 
         const segId = `seg-${now}-${Math.random().toString(36).substring(2, 7)}`;
         this.activeSegmentId = segId;
+        // P1-1: 说话开始瞬间冻结段落所使用的模型
+        this.activeSegmentModelId = this.activeModelId;
 
         // prefixSnapshot 包含过去 800ms 环境音 + 第 1 个人声候选帧
         const prefixSnapshot = this.prefixRing.snapshot();
@@ -573,6 +598,7 @@ export class AudioCaptureEngine {
           sessionEpoch: this.currentSessionEpoch,
           segmentId: segId,
           hasPrefix: prefixSnapshot.length > 0,
+          modelId: this.activeSegmentModelId,
         });
 
         // 2. 发送前缀快照 (若有)
@@ -636,11 +662,12 @@ export class AudioCaptureEngine {
     const segId = this.activeSegmentId;
     const samples = this.speechEvidenceSamples;
     const hasPartial = this.hasReceivedPartialForActiveSegment;
-    const segModelId = this.activeModelId;
+    const segModelId = this.activeSegmentModelId || this.activeModelId;
     const segConnectionGen = this.startedConnectionGeneration;
     const now = Date.now();
 
     this.activeSegmentId = null;
+    this.activeSegmentModelId = null;
     this.silenceStartMs = 0;
     this.consecutiveSpeechFrames = 0;
     this.consecutiveSilenceFrames = 0;
@@ -665,11 +692,11 @@ export class AudioCaptureEngine {
     const speechEvidenceMs = Math.round((samples / 16000) * 1000);
     this.currentSegmentPcmChunks = [];
 
-    // 关键优化 P0-4: 若已有 Partial 产生或人声采样累加 >= 180ms，判定为真语音，绝不丢失短词（“好”、“对”、“嗯”、“OK”）
-    const isGenuineSpeech = hasPartial || speechEvidenceMs >= 180;
+    // P1-2: 优化人声采样阈值 (>=100ms) 与 Partial 优先判定，确保“好/对/嗯/OK”等短词完整保留
+    const isGenuineSpeech = hasPartial || speechEvidenceMs >= 100;
 
     if (isGenuineSpeech) {
-      // 1. 本地缓存该段 PCM 与精准时间戳和模型 ID
+      // 1. 本地缓存该段 PCM 与精准时间戳和冻结的模型 ID
       this.localSegmentCache.set(segId, {
         pcm: mergedPcm,
         durationMs,
@@ -693,14 +720,14 @@ export class AudioCaptureEngine {
           durationMs,
         });
 
-        // 15秒看门狗保护：若 WS 超时未回包，检查连接状态并按需触发 HTTP Fallback
-        const watchdog = setTimeout(() => {
+        // 15秒看门狗保护：若 WS 延迟，按需触发 HTTP Fallback
+        const watchdogTimer = setTimeout(() => {
           if (this.localSegmentCache.has(segId)) {
             const currentGen = this.transport.connectionGeneration;
             const isGenValid = this.transport.ready && currentGen === segConnectionGen;
 
             if (isGenValid) {
-              console.warn(`[ASR] WS final timeout (15s) for ${segId} (connection still alive), triggering HTTP fallback...`);
+              console.warn(`[ASR] WS final timeout (15s) for ${segId} (connection still alive), triggering optimistic HTTP fallback...`);
               void this.executeHttpFallback(segId, mergedPcm, durationMs, audioStartedAt, now, 'ws-watchdog', segModelId);
             } else {
               console.warn(`[ASR] WS connection died or changed generation for ${segId}, triggering terminal HTTP fallback...`);
@@ -708,7 +735,16 @@ export class AudioCaptureEngine {
             }
           }
         }, 15000);
-        this.segmentWatchdogs.set(segId, watchdog);
+
+        // P0-3: 60秒绝对终结 deadline 定时器，杜绝任何段落无限处于 Pending
+        const deadlineTimer = setTimeout(() => {
+          if (this.localSegmentCache.has(segId)) {
+            console.error(`[ASR] Absolute settlement deadline (60s) reached for ${segId}, forcing terminal fallback/error!`);
+            void this.executeHttpFallback(segId, mergedPcm, durationMs, audioStartedAt, now, 'ws-unavailable', segModelId);
+          }
+        }, 60000);
+
+        this.segmentTimers.set(segId, { watchdog: watchdogTimer, deadline: deadlineTimer });
       } else {
         console.warn(`[ASR] Transport disconnected or reconnected mid-speech for ${segId}, immediately fallback to HTTP...`);
         void this.executeHttpFallback(segId, mergedPcm, durationMs, audioStartedAt, now, 'ws-unavailable', segModelId);
@@ -777,6 +813,7 @@ export class AudioCaptureEngine {
         return;
       }
 
+      // P0-4: 终态失败，原子 claim 并通知 onError 与 onSpeakingCancel 达成一致终态
       const cached = this.claimSegmentForFinal(segId);
       if (cached) {
         this.onError?.({
@@ -830,7 +867,7 @@ export class AudioCaptureEngine {
   }
 
   /**
-   * 强制销毁所有状态、看门狗与网络连接 (用于组件卸载或硬终止，绝不调用 finalizeSpeechSegment)
+   * 强制销毁所有状态、看门狗、deadline 定时器与网络连接 (用于组件卸载或硬终止，绝不调用 finalizeSpeechSegment)
    */
   public abortAndDispose(): void {
     // 1. 若当前处于说话状态，发送 cancel 帧并通知取消
@@ -872,12 +909,16 @@ export class AudioCaptureEngine {
       this.audioContext = null;
     }
 
-    // 4. 清理定时器与缓存
-    this.segmentWatchdogs.forEach((t) => clearTimeout(t));
-    this.segmentWatchdogs.clear();
+    // 4. 清理所有定时器与缓存
+    this.segmentTimers.forEach((t) => {
+      if (t.watchdog) clearTimeout(t.watchdog);
+      if (t.deadline) clearTimeout(t.deadline);
+    });
+    this.segmentTimers.clear();
     this.transport.disconnect();
     this.currentSegmentPcmChunks = [];
     this.activeSegmentId = null;
+    this.activeSegmentModelId = null;
     this.isSpeaking = false;
     this.speechEvidenceSamples = 0;
     this.prefixRing.clear();

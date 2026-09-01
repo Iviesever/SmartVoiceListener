@@ -715,7 +715,7 @@ async def websocket_stream_endpoint(ws: WebSocket):
                 total_samples = sum(len(c) for c in audio_chunks)
                 if total_samples >= 16000 * 120:
                     sealed_audio = np.concatenate(audio_chunks)
-                    captured_model = model_manager.selected_model_id
+                    captured_model = active_segment_model_id
                     job = FinalJob(
                         session_epoch=active_session_epoch,
                         segment_id=active_segment_id,

@@ -29,6 +29,10 @@ export function useVoiceListener(options?: UseVoiceListenerOptions) {
   // 关键修复 P0-1: 确切的待定稿 SegmentId 集合 (Single Source of Truth)
   const pendingFinalIdsRef = useRef<Set<string>>(new Set());
 
+  // 关键修复 P0-2: 原子锁与启动计数追踪
+  const startingRef = useRef<boolean>(false);
+  const startAttemptRef = useRef<number>(0);
+
   // 全局会话世代 (Session Epoch)，在清空、新开启时递增
   const sessionEpochRef = useRef<number>(1);
   const engineRef = useRef<AudioCaptureEngine | null>(null);
@@ -158,14 +162,17 @@ export function useVoiceListener(options?: UseVoiceListenerOptions) {
     }
   }, [refreshServerStatus]);
 
-  // 启动常驻双通道流式监听 (带互斥与安全初始化)
+  // 关键修复 P0-2: 启动常驻双通道流式监听 (Ref 互斥锁、Stale Guard 与失败强制 Dispose)
   const startListening = useCallback(async () => {
-    // 关键优化 P0-2: 如果正在启动中或处于旧段落 draining 定稿中，禁止重复启动
-    if (isStarting || (captureState === 'IDLE' && pendingFinalIdsRef.current.size > 0)) {
+    if (startingRef.current || (captureState === 'IDLE' && pendingFinalIdsRef.current.size > 0)) {
       return;
     }
 
+    startingRef.current = true;
     setIsStarting(true);
+    const attempt = ++startAttemptRef.current;
+    let engine: AudioCaptureEngine | null = null;
+
     try {
       if (engineRef.current) {
         engineRef.current.abortAndDispose();
@@ -176,7 +183,7 @@ export function useVoiceListener(options?: UseVoiceListenerOptions) {
       const currentSession = sessionEpochRef.current;
       clearAllPending();
 
-      const engine = new AudioCaptureEngine(vadConfig, activeModelId);
+      engine = new AudioCaptureEngine(vadConfig, activeModelId);
 
       // 0. WebSocket 握手就绪与连接状态回调
       engine.transport.onStreamReady = (_sampleRate, ready) => {
@@ -201,17 +208,19 @@ export function useVoiceListener(options?: UseVoiceListenerOptions) {
         setPauseCountdown(remainingMs);
       };
 
-      // 3. 说话结束回调（流式结束，加入精确待定稿集合）
+      // 3. 说话结束回调（流式结束，加入精确待定稿集合；安全恢复 LISTENING_SILENCE）
       engine.onSpeakingEnd = (segmentId) => {
-        setCaptureState('LISTENING_SILENCE');
+        setCaptureState((current) => (current === 'IDLE' ? 'IDLE' : 'LISTENING_SILENCE'));
         setPauseCountdown(0);
         markPending(segmentId);
         optionsRef.current?.onTranscriptSpeechEnd?.(segmentId);
       };
 
-      // 3.1 说话取消回调 (短噪声 < 180ms 过滤或主动取消)
+      // 3.1 说话取消回调 (关键修复 P0-1: 安全恢复状态，清理 pauseCountdown)
       engine.onSpeakingCancel = (segmentId) => {
         settlePending(segmentId);
+        setCaptureState((current) => (current === 'IDLE' ? 'IDLE' : 'LISTENING_SILENCE'));
+        setPauseCountdown(0);
         optionsRef.current?.onTranscriptCancelled?.(segmentId);
       };
 
@@ -282,47 +291,55 @@ export function useVoiceListener(options?: UseVoiceListenerOptions) {
 
       await engine.start(currentSession);
 
-      // 若在启动异步过程中用户切换了世代，安全放弃
-      if (currentSession !== sessionEpochRef.current) {
+      // Stale attempt 守护：若启动过程中发生过新 attempt 或 sessionEpoch 已变，释放废弃 engine
+      if (attempt !== startAttemptRef.current || currentSession !== sessionEpochRef.current) {
         engine.abortAndDispose();
         return;
       }
 
       engineRef.current = engine;
+      engine = null;
       setCaptureState('LISTENING_SILENCE');
     } catch (err) {
-      console.error('Failed to start AudioCaptureEngine:', err);
-      alert('启动麦克风失败，请检查浏览器麦克风权限！');
-      setCaptureState('IDLE');
-    } finally {
-      setIsStarting(false);
-    }
-  }, [isStarting, captureState, vadConfig, activeModelId, markPending, settlePending, clearAllPending]);
+      // 关键修复 P0-2: 启动失败立即强制硬销毁局部 engine，绝不泄漏
+      engine?.abortAndDispose();
 
-  // 停止监听 (优雅停止麦克风采集，但保留已录制段落的定稿结算权)
+      if (attempt === startAttemptRef.current) {
+        setCaptureState('IDLE');
+        console.error('Failed to start AudioCaptureEngine:', err);
+        alert('启动麦克风失败，请检查浏览器麦克风权限！');
+      }
+    } finally {
+      if (attempt === startAttemptRef.current) {
+        startingRef.current = false;
+        setIsStarting(false);
+      }
+    }
+  }, [captureState, vadConfig, activeModelId, markPending, settlePending, clearAllPending]);
+
+  // 关键修复 P0-1: 停止监听时先执行 stopCaptureGracefully，最后更新 IDLE
   const stopListening = useCallback(() => {
+    engineRef.current?.stopCaptureGracefully();
+
     setCaptureState('IDLE');
     setVolume(0);
     setPauseCountdown(0);
     setStreamingReady(false);
 
-    if (engineRef.current) {
-      engineRef.current.stopCaptureGracefully();
-      if (engineRef.current.localSegmentCache.size === 0) {
-        engineRef.current = null;
-      }
+    if (engineRef.current?.localSegmentCache.size === 0) {
+      engineRef.current = null;
     }
   }, []);
 
   // 切换监听状态
   const toggleListening = useCallback(() => {
-    if (isStarting || isFinalizing) return;
+    if (startingRef.current || isFinalizing) return;
     if (isCapturing) {
       stopListening();
     } else {
       void startListening();
     }
-  }, [isStarting, isFinalizing, isCapturing, startListening, stopListening]);
+  }, [isFinalizing, isCapturing, startListening, stopListening]);
 
   // 清空文档与后台 Segments (原子重置会话世代，取消飞行中的所有录音)
   const resetWorkspace = useCallback(() => {

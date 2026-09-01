@@ -35,34 +35,42 @@ if (!existsSync(nodeModulesPath)) {
   console.log(green('[成功] 前端依赖安装完成！\n'));
 }
 
-// 2. 检查模型文件完整性 (Silero VAD, SenseVoice, Streaming Paraformer 全量文件)
+// 2. 检查模型文件完整性 (Mandatory: SenseVoice; Optional: Streaming Paraformer)
 const modelsDir = resolve(rootDir, 'models');
-const vadModel = resolve(modelsDir, 'silero_vad.onnx');
 const sensevoiceDir = resolve(modelsDir, 'sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17');
 const sensevoiceModel = existsSync(resolve(sensevoiceDir, 'model.int8.onnx')) || existsSync(resolve(sensevoiceDir, 'model.onnx'));
-const sensevoiceTokens = resolve(sensevoiceDir, 'tokens.txt');
+const sensevoiceTokens = existsSync(resolve(sensevoiceDir, 'tokens.txt'));
+const senseVoiceReady = sensevoiceModel && sensevoiceTokens;
 
 const paraformerDir = resolve(modelsDir, 'sherpa-onnx-streaming-paraformer-bilingual-zh-en');
-const paraformerEncoder = resolve(paraformerDir, 'encoder.int8.onnx');
-const paraformerDecoder = resolve(paraformerDir, 'decoder.int8.onnx');
-const paraformerTokens = resolve(paraformerDir, 'tokens.txt');
+const paraformerEncoder = existsSync(resolve(paraformerDir, 'encoder.int8.onnx'));
+const paraformerDecoder = existsSync(resolve(paraformerDir, 'decoder.int8.onnx'));
+const paraformerTokens = existsSync(resolve(paraformerDir, 'tokens.txt'));
+const streamingReady = paraformerEncoder && paraformerDecoder && paraformerTokens;
 
-const allModelsPresent =
-  existsSync(vadModel) &&
-  sensevoiceModel &&
-  existsSync(sensevoiceTokens) &&
-  existsSync(paraformerEncoder) &&
-  existsSync(paraformerDecoder) &&
-  existsSync(paraformerTokens);
-
-if (!allModelsPresent) {
-  console.log(yellow('[提示] 检测到模型文件不完整，正在自动补全/拉取模型...'));
+if (!senseVoiceReady || !streamingReady) {
+  console.log(yellow('[提示] 检测到模型文件不完整，正在尝试自动补全/拉取模型...'));
   const pyCmd = isWin ? 'python' : 'python3';
   const dlRes = spawnSync(pyCmd, ['download_models.py'], { cwd: rootDir, stdio: 'inherit' });
   if (dlRes.status !== 0) {
-    console.log(red('[错误] download_models.py 执行失败，请检查网络连接！'));
-    process.exit(1);
+    console.log(yellow('[警告] download_models.py 执行未成功，正在复查模型可用性...'));
   }
+}
+
+const sensevoiceModelAfter = existsSync(resolve(sensevoiceDir, 'model.int8.onnx')) || existsSync(resolve(sensevoiceDir, 'model.onnx'));
+const sensevoiceTokensAfter = existsSync(resolve(sensevoiceDir, 'tokens.txt'));
+if (!sensevoiceModelAfter || !sensevoiceTokensAfter) {
+  console.log(red('\n[错误] SenseVoice 模型文件缺失，服务无法启动！请检查 models 目录或网络连接。'));
+  process.exit(1);
+}
+
+const paraformerReadyAfter =
+  existsSync(resolve(paraformerDir, 'encoder.int8.onnx')) &&
+  existsSync(resolve(paraformerDir, 'decoder.int8.onnx')) &&
+  existsSync(resolve(paraformerDir, 'tokens.txt'));
+
+if (!paraformerReadyAfter) {
+  console.log(yellow('[提示] Streaming Paraformer 模型缺失，系统将以 Final-Only (仅离线定稿) 优雅降级模式启动。'));
 }
 
 // 3. 查找支持 GPU (CUDA) 的最佳 Python 解释器

@@ -52,9 +52,16 @@ describe('Resampler (Real TypeScript)', () => {
 });
 
 describe('AudioCaptureEngine Settlement & Lifecycle (Real TypeScript)', () => {
-  it('claimSegmentForFinal should be atomic and exactly-once', () => {
+  it('claimSegmentForFinal should be atomic and clear both watchdog and deadline timers', () => {
     const engine = new AudioCaptureEngine();
     const segId = 'seg-test-001';
+
+    const watchdogSpy = vi.fn();
+    const deadlineSpy = vi.fn();
+    const wTimer = setTimeout(watchdogSpy, 15000);
+    const dTimer = setTimeout(deadlineSpy, 60000);
+
+    (engine as any).segmentTimers.set(segId, { watchdog: wTimer, deadline: dTimer });
 
     // Populate localSegmentCache
     engine.localSegmentCache.set(segId, {
@@ -67,46 +74,126 @@ describe('AudioCaptureEngine Settlement & Lifecycle (Real TypeScript)', () => {
 
     expect(engine.localSegmentCache.has(segId)).toBe(true);
 
-    // First claim: should succeed and return cached data
+    // First claim: succeeds, returns cached data and cancels both timers
     const claim1 = engine.claimSegmentForFinal(segId);
     expect(claim1).toBeDefined();
     expect(claim1?.durationMs).toBe(1000);
     expect(claim1?.modelId).toBe('sensevoice-onnx');
     expect(engine.localSegmentCache.has(segId)).toBe(false);
+    expect((engine as any).segmentTimers.has(segId)).toBe(false);
 
-    // Second concurrent claim (e.g. late WS or HTTP duplicate): should return undefined
+    // Second concurrent claim: returns undefined
     const claim2 = engine.claimSegmentForFinal(segId);
     expect(claim2).toBeUndefined();
   });
 
-  it('resetSession should cancel all pending segments via onSpeakingCancel', () => {
+  it('resetSession should cancel all pending segments and active segment via onSpeakingCancel', () => {
     const engine = new AudioCaptureEngine();
     const cancelSpy = vi.fn();
     engine.onSpeakingCancel = cancelSpy;
+
+    (engine as any).isSpeaking = true;
+    (engine as any).activeSegmentId = 'seg-active-now';
 
     engine.localSegmentCache.set('seg-a', { pcm: new Float32Array(100), durationMs: 100, startedAt: 0, endedAt: 100 });
     engine.localSegmentCache.set('seg-b', { pcm: new Float32Array(100), durationMs: 100, startedAt: 0, endedAt: 100 });
 
     engine.resetSession(2);
 
+    expect(cancelSpy).toHaveBeenCalledWith('seg-active-now');
     expect(cancelSpy).toHaveBeenCalledWith('seg-a');
     expect(cancelSpy).toHaveBeenCalledWith('seg-b');
     expect(engine.localSegmentCache.size).toBe(0);
   });
 
-  it('abortAndDispose should cancel all pending segments without finalizing active speech', () => {
+  it('abortAndDispose with real active speech should cancel active speech and NOT call onSpeakingEnd', () => {
     const engine = new AudioCaptureEngine();
     const cancelSpy = vi.fn();
     const endSpy = vi.fn();
     engine.onSpeakingCancel = cancelSpy;
     engine.onSpeakingEnd = endSpy;
 
+    (engine as any).isSpeaking = true;
+    (engine as any).activeSegmentId = 'seg-active-speech';
     engine.localSegmentCache.set('seg-pending', { pcm: new Float32Array(100), durationMs: 100, startedAt: 0, endedAt: 100 });
 
     engine.abortAndDispose();
 
+    // 关键验证：active segment 和 pending segment 均触发 cancel，且绝不调用 onSpeakingEnd
+    expect(cancelSpy).toHaveBeenCalledWith('seg-active-speech');
     expect(cancelSpy).toHaveBeenCalledWith('seg-pending');
     expect(endSpy).not.toHaveBeenCalled();
     expect(engine.localSegmentCache.size).toBe(0);
+  });
+
+  it('stopCaptureGracefully should finalize active speech when speaking', () => {
+    const engine = new AudioCaptureEngine();
+    const endSpy = vi.fn();
+    engine.onSpeakingEnd = endSpy;
+
+    (engine as any).isSpeaking = true;
+    (engine as any).activeSegmentId = 'seg-graceful';
+    (engine as any).speechEvidenceSamples = 3200; // 200ms >= 100ms
+    (engine as any).currentSegmentPcmChunks = [new Float32Array(3200)];
+
+    engine.stopCaptureGracefully();
+
+    expect(endSpy).toHaveBeenCalledWith('seg-graceful', 200);
+    expect(engine.localSegmentCache.has('seg-graceful')).toBe(true);
+  });
+
+  it('should freeze activeModelId into SpeechStartPayload and localSegmentCache', () => {
+    const engine = new AudioCaptureEngine(undefined, 'qwen3-asr-1.7b');
+    const sendMsgSpy = vi.fn();
+    engine.transport.sendMessage = sendMsgSpy;
+
+    // Trigger speech frame
+    const chunk = new Float32Array(1600);
+    for (let i = 0; i < chunk.length; i++) chunk[i] = 0.5;
+
+    (engine as any).consecutiveSpeechFrames = 1; // will hit threshold on next frame
+    (engine as any).processAudioFrame(chunk);
+
+    expect(sendMsgSpy).toHaveBeenCalledWith(
+      expect.objectContaining({
+        type: 'speech_start',
+        modelId: 'qwen3-asr-1.7b',
+      })
+    );
+
+    // If user switches activeModelId during speech
+    engine.activeModelId = 'sensevoice-onnx';
+
+    // When finalized, the segment should still preserve the frozen 'qwen3-asr-1.7b'
+    (engine as any).finalizeSpeechSegment();
+
+    const cached = Array.from(engine.localSegmentCache.values())[0];
+    expect(cached?.modelId).toBe('qwen3-asr-1.7b');
+  });
+
+  it('should accept short utterance with >= 100ms voiced samples and reject click noise', () => {
+    const engine = new AudioCaptureEngine();
+    const endSpy = vi.fn();
+    const cancelSpy = vi.fn();
+    engine.onSpeakingEnd = endSpy;
+    engine.onSpeakingCancel = cancelSpy;
+
+    // 1. Short valid utterance: "好" (120ms = 1920 samples @ 16kHz)
+    (engine as any).activeSegmentId = 'seg-hao';
+    (engine as any).isSpeaking = true;
+    (engine as any).speechEvidenceSamples = 1920;
+    (engine as any).currentSegmentPcmChunks = [new Float32Array(1920)];
+
+    (engine as any).finalizeSpeechSegment();
+    expect(endSpy).toHaveBeenCalledWith('seg-hao', 120);
+
+    // 2. Click noise: 50ms = 800 samples < 100ms
+    (engine as any).activeSegmentId = 'seg-click';
+    (engine as any).isSpeaking = true;
+    (engine as any).speechEvidenceSamples = 800;
+    (engine as any).currentSegmentPcmChunks = [new Float32Array(800)];
+
+    (engine as any).finalizeSpeechSegment();
+    expect(cancelSpy).toHaveBeenCalledWith('seg-click');
   });
 });

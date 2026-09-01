@@ -53,6 +53,7 @@ export interface SpeechStartPayload {
   sessionEpoch: number;
   segmentId: string;
   hasPrefix: boolean;
+  modelId?: string;
 }
 
 export interface SpeechEndPayload {
