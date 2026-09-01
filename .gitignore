@@ -1,0 +1,62 @@
+# ==========================================
+# 依赖与打包产物
+# ==========================================
+node_modules/
+dist/
+dist-ssr/
+*.local
+.vite/
+
+# ==========================================
+# AI 模型大文件 (严禁提交至 Git)
+# ==========================================
+models/
+*.onnx
+*.pt
+*.bin
+*.safetensors
+*.tar.bz2
+*.tar.gz
+*.zip
+*.wav
+*.mp3
+
+# ==========================================
+# Python 运行缓存与环境
+# ==========================================
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+.venv/
+ENV/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# ==========================================
+# 临时任务与测试日志
+# ==========================================
+*.log
+npm-debug.log*
+yarn-debug.log*
+pnpm-debug.log*
+.agents/
+tasks/
+temp/
+scratch/
+
+# ==========================================
+# 系统与 IDE 配置
+# ==========================================
+.DS_Store
+Thumbs.db
+Desktop.ini
+.idea/
+.vscode/*
+!.vscode/settings.json
+!.vscode/tasks.json
+!.vscode/extensions.json
