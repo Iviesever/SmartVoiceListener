@@ -317,6 +317,7 @@ export class AudioCaptureEngine {
   public onSpeakingStart?: (segmentId: string) => void;
   public onSpeakingPause?: (remainingMs: number) => void;
   public onSpeakingEnd?: (segmentId: string, durationMs: number) => void;
+  public onSpeakingCancel?: (segmentId: string) => void;
   public onVolumeUpdate?: (volume: number, isSpeech: boolean, noiseFloor: number) => void;
   public onPartial?: (event: ServerPartialEvent) => void;
   public onFinal?: (event: ServerFinalEvent, cachedData?: LocalSegmentData) => void;
@@ -379,6 +380,11 @@ export class AudioCaptureEngine {
       this.segmentWatchdogs.delete(segmentId);
     }
 
+    // 若采集已停止且所有在飞段落已全部定稿结算完毕，优雅关闭网络传输
+    if (this.mediaStream === null && this.localSegmentCache.size === 0) {
+      this.transport.disconnect();
+    }
+
     return cached;
   }
 
@@ -392,13 +398,15 @@ export class AudioCaptureEngine {
    * 原子重置会话世代 (在点击清空文档或重置工作区时调用，复用同一个麦克风时钟)
    */
   public resetSession(newEpoch: number) {
-    // 1. 若当前有未完结的说话段，发送 cancel
+    // 1. 若当前有未完结的说话段，发送 cancel 并通知 UI 清理 ephemeral 投影
     if (this.isSpeaking && this.activeSegmentId) {
+      const segId = this.activeSegmentId;
       this.transport.sendMessage({
         type: 'speech_cancel',
         sessionEpoch: this.currentSessionEpoch,
-        segmentId: this.activeSegmentId,
+        segmentId: segId,
       });
+      this.onSpeakingCancel?.(segId);
     }
 
     // 2. 清理所有看门狗定时器
@@ -676,6 +684,8 @@ export class AudioCaptureEngine {
           segmentId: segId,
         });
       }
+      // 关键修复：通知 UI 移除该短杂音段的 ephemeral 投影
+      this.onSpeakingCancel?.(segId);
     }
   }
 
@@ -729,7 +739,7 @@ export class AudioCaptureEngine {
       }
 
       // 若处于 ws-unavailable 模式（WS 彻底未连或 mid-speech 重连无上下文），
-      // 则说明不会有任何 WS Final 到达，此时才正式 settle error 并清理缓存。
+      // 则说明不会有任何 WS Final 到达，此时才正式 settle error 并通知 UI 清除 ephemeral。
       const cached = this.claimSegmentForFinal(segId);
       if (cached) {
         this.onError?.({
@@ -738,17 +748,19 @@ export class AudioCaptureEngine {
           segmentId: segId,
           message: 'HTTP Fallback failed and WebSocket unavailable',
         });
+        this.onSpeakingCancel?.(segId);
       }
     }
   }
 
-  public stop(): void {
+  /**
+   * 停止麦克风音频采集，但保留 WebSocket 与已录制片段的定稿结算权
+   * (保证停止监听时，已说出口的最后一句能完整定稿并提交到正文)
+   */
+  public stopCapture(): void {
     if (this.isSpeaking) {
       this.finalizeSpeechSegment();
     }
-
-    this.segmentWatchdogs.forEach((t) => clearTimeout(t));
-    this.segmentWatchdogs.clear();
 
     if (this.mediaStream) {
       this.mediaStream.getTracks().forEach((t) => t.stop());
@@ -771,13 +783,33 @@ export class AudioCaptureEngine {
       this.audioContext = null;
     }
 
-    this.transport.disconnect();
-    this.currentSegmentPcmChunks = [];
-    this.activeSegmentId = null;
     this.isSpeaking = false;
     this.lastSpeechEvidenceAt = 0;
     this.prefixRing.clear();
+
+    // 若当前没有任何在飞或待定稿的段落，立即断开 WebSocket
+    if (this.localSegmentCache.size === 0) {
+      this.transport.disconnect();
+    }
+  }
+
+  /**
+   * 强制销毁所有状态、看门狗与网络连接
+   */
+  public dispose(): void {
+    this.stopCapture();
+
+    this.segmentWatchdogs.forEach((t) => clearTimeout(t));
+    this.segmentWatchdogs.clear();
+
+    this.transport.disconnect();
+    this.currentSegmentPcmChunks = [];
+    this.activeSegmentId = null;
     this.localSegmentCache.clear();
+  }
+
+  public stop(): void {
+    this.dispose();
   }
 }
 

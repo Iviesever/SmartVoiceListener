@@ -38,6 +38,11 @@ export default function App() {
     editorRef.current?.commitStreamingFinal(segmentId, text);
   }, []);
 
+  // 4. 取消/丢弃回调：清除对应 segmentId 的 ephemeral 投影 (短噪声、取消或彻底失败)
+  const handleTranscriptCancelled = useCallback((segmentId: string) => {
+    editorRef.current?.clearStreamingPartial(segmentId);
+  }, []);
+
   // 文档内容变化防抖持久化 (600ms debounce)
   const handleDocChange = useCallback((text: string, count: number) => {
     latestDocRef.current = text;
@@ -71,6 +76,7 @@ export default function App() {
     onTranscriptPartial: handleTranscriptPartial,
     onTranscriptSpeechEnd: handleTranscriptSpeechEnd,
     onTranscriptFinal: handleTranscriptFinal,
+    onTranscriptCancelled: handleTranscriptCancelled,
   });
 
   // 监听 pagehide 与 visibilitychange，在刷新/关闭/切后台时同步立即落盘文档
