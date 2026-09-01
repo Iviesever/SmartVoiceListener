@@ -436,10 +436,10 @@ async def post_switch_model(request: Request):
         if not model_id or model_id not in AVAILABLE_MODELS:
             return JSONResponse(status_code=400, content={"error": f"Invalid modelId: {model_id}"})
 
-        # 保护：更新 selected_model_id 并在 scheduler 信号量内预装载
+        # 保护：在 scheduler 信号量内先装载，装载成功后才 commit 更新 selected_model_id
         async with inference_scheduler.semaphore:
-            model_manager.selected_model_id = model_id
             await asyncio.to_thread(model_manager.load_engine, model_id)
+            model_manager.selected_model_id = model_id
 
         active_info = AVAILABLE_MODELS[model_manager.selected_model_id]
         return {

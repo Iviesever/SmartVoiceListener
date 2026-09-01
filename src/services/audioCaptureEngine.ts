@@ -108,6 +108,9 @@ export class StreamingTransport {
   private reconnectAttempts = 0;
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
 
+  // 记录连接世代，用于检测中途断线重连 (mid-speech reconnect detection)
+  public connectionGeneration = 0;
+
   public onStreamReady?: (sampleRate: number, streamingReady: boolean) => void;
   public onPartial?: (event: ServerPartialEvent) => void;
   public onFinal?: (event: ServerFinalEvent) => void;
@@ -153,10 +156,11 @@ export class StreamingTransport {
         this.ws.binaryType = 'arraybuffer';
 
         this.ws.onopen = () => {
+          this.connectionGeneration++;
           this.isConnected = true;
           this.reconnectAttempts = 0;
           this.onConnectionChange?.(true);
-          console.log('[WS] Connected to Streaming ASR server:', this.wsUrl);
+          console.log(`[WS] Connected to Streaming ASR server (gen #${this.connectionGeneration}):`, this.wsUrl);
 
           // 发送 stream_init 握手帧
           this.sendMessage({
@@ -292,6 +296,7 @@ export class AudioCaptureEngine {
   private readonly prefixRing = new PrefixRingBuffer(12800); // 16000 * 0.8s = 12800 samples
   private currentSessionEpoch = 1;
   private activeSegmentId: string | null = null;
+  private startedConnectionGeneration = 0;
   private isSpeaking = false;
   private speechStartMs = 0;
   private silenceStartMs = 0;
@@ -335,26 +340,45 @@ export class AudioCaptureEngine {
       }
     };
 
+    // 关键修复 Blocker: WS Final 到达时执行原子 claim，确保 exactly-once settlement
     this.transport.onFinal = (event) => {
-      const segId = event.segmentId;
-      // 清除该段的超时兜底定时器
-      const timer = this.segmentWatchdogs.get(segId);
-      if (timer) {
-        clearTimeout(timer);
-        this.segmentWatchdogs.delete(segId);
+      const cached = this.claimSegmentForFinal(event.segmentId);
+      if (!cached) {
+        // 已经被 HTTP fallback 抢先完成认领并落库，忽略迟到的 WS Final
+        return;
       }
 
-      // 获取 cachedData 传给回调，再清理 localSegmentCache
-      const cached = this.localSegmentCache.get(segId);
       if (event.sessionEpoch === this.currentSessionEpoch) {
         this.onFinal?.(event, cached);
       }
-      this.localSegmentCache.delete(segId);
     };
 
     this.transport.onError = (event) => {
       this.onError?.(event);
     };
+  }
+
+  /**
+   * 原子性认领一个 segmentId 的 Final 结算权 (Exactly-Once Settlement)
+   * 无论来自 WebSocket Final 还是 HTTP Fallback，只有第一个认领者能成功并获得 cachedData
+   */
+  private claimSegmentForFinal(segmentId: string): LocalSegmentData | undefined {
+    const cached = this.localSegmentCache.get(segmentId);
+    if (!cached) {
+      return undefined;
+    }
+
+    // 立即删除缓存，阻断后续任何竞争通道
+    this.localSegmentCache.delete(segmentId);
+
+    // 清除看门狗定时器
+    const timer = this.segmentWatchdogs.get(segmentId);
+    if (timer) {
+      clearTimeout(timer);
+      this.segmentWatchdogs.delete(segmentId);
+    }
+
+    return cached;
   }
 
   public updateConfig(newConfig: Partial<VadConfig>) {
@@ -488,6 +512,7 @@ export class AudioCaptureEngine {
         this.silenceStartMs = 0;
         this.consecutiveSpeechFrames = 0;
         this.consecutiveSilenceFrames = 0;
+        this.startedConnectionGeneration = this.transport.connectionGeneration;
 
         const segId = `seg-${now}-${Math.random().toString(36).substring(2, 7)}`;
         this.activeSegmentId = segId;
@@ -560,13 +585,14 @@ export class AudioCaptureEngine {
   private finalizeSpeechSegment() {
     this.isSpeaking = false;
     const segId = this.activeSegmentId;
+    const startMs = this.speechStartMs;
     const now = Date.now();
 
     this.activeSegmentId = null;
     this.silenceStartMs = 0;
     this.consecutiveSpeechFrames = 0;
     this.consecutiveSilenceFrames = 0;
-    this.prefixRing.clear(); // 关键修复：切段时清空前缀环，防止残留污染下一段
+    this.prefixRing.clear(); // 切段时清空前缀环，防止残留污染下一段
 
     if (!segId || this.currentSegmentPcmChunks.length === 0) return;
 
@@ -592,12 +618,12 @@ export class AudioCaptureEngine {
     }
 
     const durationMs = Math.round((totalLength / 16000) * 1000);
-    // 关键修复：精确计算音频实际起始时间点（包含前缀）
     const audioStartedAt = now - durationMs;
+    const activeDurationMs = now - startMs;
     this.currentSegmentPcmChunks = [];
 
-    // 过滤掉低于 450ms 的短促冲击杂音
-    if (durationMs >= 450) {
+    // 关键修复：用真正活跃讲话净时长过滤低于 450ms 的短促冲击杂音
+    if (activeDurationMs >= 450) {
       // 1. 本地缓存该段 PCM 与精准起止时间
       this.localSegmentCache.set(segId, {
         pcm: mergedPcm,
@@ -608,8 +634,12 @@ export class AudioCaptureEngine {
 
       this.onSpeakingEnd?.(segId, durationMs);
 
-      // 2. 判断 WebSocket 是否在线：在线则发送 speech_end，不在线直接走 HTTP Fallback
-      if (this.transport.ready) {
+      // 2. 检查 WebSocket 是否在线且在当前段录制期间未曾发生过断线重连 (mid-speech reconnect)
+      const isConnectionContinuous =
+        this.transport.ready &&
+        this.transport.connectionGeneration === this.startedConnectionGeneration;
+
+      if (isConnectionContinuous) {
         this.transport.sendMessage({
           type: 'speech_end',
           sessionEpoch: this.currentSessionEpoch,
@@ -626,7 +656,7 @@ export class AudioCaptureEngine {
         }, 15000);
         this.segmentWatchdogs.set(segId, watchdog);
       } else {
-        console.warn(`[ASR] Transport offline at speech_end for ${segId}, immediately fallback to HTTP...`);
+        console.warn(`[ASR] Transport disconnected or reconnected mid-speech for ${segId}, immediately fallback to HTTP...`);
         void this.executeHttpFallback(segId, mergedPcm, durationMs, audioStartedAt, now);
       }
     } else {
@@ -650,42 +680,43 @@ export class AudioCaptureEngine {
     try {
       const wavBlob = pcmToWavBlob(pcm, 16000);
       const res = await transcribeAudioBlob(wavBlob);
-      const cachedData: LocalSegmentData = {
+
+      // 关键修复 Blocker: 原子认领 Final 结算权
+      const cached = this.claimSegmentForFinal(segId);
+      if (!cached) {
+        // WS Final 已经抢先一步完成结算并落库
+        return;
+      }
+
+      const segmentData: LocalSegmentData = {
         pcm,
         durationMs,
         startedAt,
         endedAt,
       };
 
-      if (this.localSegmentCache.has(segId)) {
-        this.onFinal?.(
-          {
-            type: 'final',
-            sessionEpoch: this.currentSessionEpoch,
-            segmentId: segId,
-            text: res.text,
-            modelId: res.modelId || 'http-fallback',
-            costMs: 0,
-            finalSource: 'second_pass',
-          },
-          cachedData
-        );
-        this.localSegmentCache.delete(segId);
-      }
+      this.onFinal?.(
+        {
+          type: 'final',
+          sessionEpoch: this.currentSessionEpoch,
+          segmentId: segId,
+          text: res.text,
+          modelId: res.modelId || 'http-fallback',
+          costMs: 0,
+          finalSource: 'second_pass',
+        },
+        segmentData
+      );
     } catch (err) {
       console.error(`[ASR] HTTP fallback failed for segment ${segId}:`, err);
-      this.onError?.({
-        type: 'error',
-        sessionEpoch: this.currentSessionEpoch,
-        segmentId: segId,
-        message: 'HTTP Fallback failed',
-      });
-      this.localSegmentCache.delete(segId);
-    } finally {
-      const timer = this.segmentWatchdogs.get(segId);
-      if (timer) {
-        clearTimeout(timer);
-        this.segmentWatchdogs.delete(segId);
+      const cached = this.claimSegmentForFinal(segId);
+      if (cached) {
+        this.onError?.({
+          type: 'error',
+          sessionEpoch: this.currentSessionEpoch,
+          segmentId: segId,
+          message: 'HTTP Fallback failed',
+        });
       }
     }
   }

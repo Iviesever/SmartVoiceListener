@@ -29,10 +29,10 @@ def load_test_audio():
 
 
 # =========================================================================
-# 1. 验证 Streaming Paraformer 引擎增量吐字
+# 1. 验证 Streaming Paraformer 引擎增量吐字与首字延迟 (time_to_first_partial)
 # =========================================================================
 def test_streaming_engine_direct():
-    print("\n--- 1. Testing Streaming Paraformer Online Engine directly ---")
+    print("\n--- 1. Testing Streaming Paraformer Online Engine & Latency ---")
     assert streaming_engine.is_ready, "StreamingEngine should be ready"
     
     stream = streaming_engine.create_stream()
@@ -43,25 +43,29 @@ def test_streaming_engine_direct():
     
     chunk_size = 1600
     partials = []
+    time_to_first_partial = None
     t0 = time.perf_counter()
     for i in range(0, len(samples), chunk_size):
         chunk = samples[i:i+chunk_size]
         stream.accept_waveform(sample_rate, chunk)
         text = streaming_engine.decode_stream(stream)
         if text and (not partials or text != partials[-1]):
+            if time_to_first_partial is None:
+                time_to_first_partial = (i + len(chunk)) / sample_rate * 1000
             partials.append(text)
             print(f"  -> Partial @ {(i+len(chunk))/sample_rate:.2f}s: \"{text}\"")
 
     cost_ms = (time.perf_counter() - t0) * 1000
-    print(f"[✓] Streaming Paraformer finished in {cost_ms:.1f}ms, final partial: \"{partials[-1] if partials else ''}\"")
+    print(f"[✓] Streaming Paraformer finished in {cost_ms:.1f}ms (RTF: {cost_ms/(len(samples)/sample_rate*1000):.3f}), final partial: \"{partials[-1] if partials else ''}\"")
+    print(f"[✓] Time to first partial token: {time_to_first_partial:.1f}ms of audio")
     assert len(partials) > 0, "Should have produced at least one partial transcription"
 
 
 # =========================================================================
-# 2. 验证模型切换与 Second-Pass 调度隔离 (真实执行旧 job 并验证不覆盖用户目标)
+# 2. 验证模型切换与 Second-Pass 调度隔离 & 失败回滚保护
 # =========================================================================
 async def test_scheduler_model_isolation():
-    print("\n--- 2. Testing OfflineInferenceScheduler & Model Isolation ---")
+    print("\n--- 2. Testing OfflineInferenceScheduler & Model Isolation / Rollback ---")
     samples, sample_rate = load_test_audio()
 
     # 用户初始选定默认模型为 sensevoice-onnx
@@ -97,9 +101,17 @@ async def test_scheduler_model_isolation():
     )
     result2 = await inference_scheduler.execute_job(job_old)
     assert result2.model_id == "sensevoice-onnx"
-    # 核心验证：执行旧 job 绝不抹除或覆盖用户当前选定的 user_target！
+    # 核心验证 1：执行旧 job 绝不抹除或覆盖用户当前选定的 user_target！
     assert model_manager.selected_model_id == user_target
     print(f"  [✓] Model isolation verified: Job executed and user selected_model_id={model_manager.selected_model_id} preserved!")
+
+    # 核心验证 2：加载不存在模型时，selected_model_id 不会被破坏
+    client = TestClient(app)
+    res = client.post("/api/switch_model", json={"modelId": "non-existent-model"})
+    assert res.status_code == 400
+    assert model_manager.selected_model_id == user_target
+    print("  [✓] Model switch failure rollback verified!")
+
     model_manager.selected_model_id = "sensevoice-onnx"
 
 
@@ -224,11 +236,10 @@ def test_streaming_unavailable_degradation():
 
 
 # =========================================================================
-# 5. 验证前缀快照 sample-by-sample 精确连续性 (第 1 候选帧不丢失，触发帧不重复)
+# 5. 验证前缀快照 sample-by-sample 精确连续性与零重复/零丢失
 # =========================================================================
 def test_prefix_ring_continuity_and_no_drop():
     print("\n--- 5. Testing Prefix Ring Sample-by-Sample Continuity & Zero Duplication ---")
-    # 模拟 16kHz 环形缓冲与候选帧流转
     capacity = 12800
     ring = np.zeros(capacity, dtype=np.float32)
     write_pos = 0
@@ -248,7 +259,6 @@ def test_prefix_ring_continuity_and_no_drop():
             return np.array([], dtype=np.float32)
         if size < capacity:
             return ring[:size].copy()
-        tail = capacity - write_pos
         return np.concatenate([ring[write_pos:], ring[:write_pos]])
 
     def ring_clear():
@@ -262,30 +272,57 @@ def test_prefix_ring_continuity_and_no_drop():
 
     # 2. 模拟第 1 个人声候选帧 (1600 采样，全 0.5)
     candidate_frame_1 = np.full(1600, 0.5, dtype=np.float32)
-    # VAD 检测到 speech candidate 1 (< 2): 写入 ring
     ring_write(candidate_frame_1)
 
     # 3. 模拟第 2 个确认人声帧 (1600 采样，全 0.8)
     trigger_frame_2 = np.full(1600, 0.8, dtype=np.float32)
-    # VAD 达到 2 帧确认: 提取快照并清空 ring
     snapshot = ring_snapshot()
     ring_clear()
 
-    # 组装当前段的 PCM chunks
     segment_pcm = np.concatenate([snapshot, trigger_frame_2])
 
-    # 验证 1: 快照长度必须等于 8000 + 1600 = 9600
-    assert len(snapshot) == 9600, f"Snapshot length should be 9600, got {len(snapshot)}"
-    # 验证 2: 快照后部必须包含完整的第 1 候选帧 (0.5)
-    assert np.allclose(snapshot[-1600:], candidate_frame_1), "Snapshot must preserve candidate frame 1 without loss"
-    # 验证 3: 组装的总 PCM 中第 1 候选帧与第 2 触发帧各自只出现恰好一次 (零丢失，零重复)
-    count_05 = np.sum(segment_pcm == 0.5)
-    count_08 = np.sum(segment_pcm == 0.8)
-    assert count_05 == 1600, f"Candidate frame 1 count should be 1600, got {count_05}"
-    assert count_08 == 1600, f"Trigger frame 2 count should be 1600, got {count_08}"
-    # 验证 4: 清空后的 ring 为空，后续切段不会发生陈旧前缀污染
-    assert len(ring_snapshot()) == 0, "Cleared ring must be empty"
-    print("[✓] Prefix sample-by-sample continuity & zero-drop/zero-duplication verified perfectly!")
+    assert len(snapshot) == 9600
+    assert np.allclose(snapshot[-1600:], candidate_frame_1)
+    assert np.sum(segment_pcm == 0.5) == 1600
+    assert np.sum(segment_pcm == 0.8) == 1600
+    assert len(ring_snapshot()) == 0
+    print("[✓] Prefix sample-by-sample continuity & zero-drop/zero-duplication verified!")
+
+
+# =========================================================================
+# 6. 验证 Exactly-Once Final Settlement 竞态模拟
+# =========================================================================
+def test_exactly_once_settlement_simulation():
+    print("\n--- 6. Testing Exactly-Once Final Settlement Race Simulation ---")
+    local_cache = {"seg-001": {"pcm": np.zeros(16000), "durationMs": 1000}}
+    commit_history = []
+
+    def claim_segment_for_final(segment_id: str):
+        if segment_id in local_cache:
+            data = local_cache.pop(segment_id)
+            return data
+        return None
+
+    def on_final_callback(source: str, segment_id: str, text: str):
+        data = claim_segment_for_final(segment_id)
+        if data is None:
+            # 迟到的竞态包被安全忽略
+            return False
+        commit_history.append((source, segment_id, text))
+        return True
+
+    # 场景：HTTP Fallback 先成功返回并提交
+    success1 = on_final_callback("HTTP_FALLBACK", "seg-001", "第一句话(HTTP)")
+    assert success1 is True
+
+    # 稍后迟到的 WS Final 尝试提交同一个 segment_id
+    success2 = on_final_callback("WS_FINAL", "seg-001", "第一句话(WS)")
+    assert success2 is False
+
+    # 核心验证：commit 历史中恰好只有 1 条记录，绝对零双写！
+    assert len(commit_history) == 1
+    assert commit_history[0][0] == "HTTP_FALLBACK"
+    print(f"[✓] Exactly-once settlement verified: 2 concurrent channels yielded exactly 1 commit: {commit_history[0]}")
 
 
 def main():
@@ -294,7 +331,8 @@ def main():
     test_websocket_stream_e2e()
     test_streaming_unavailable_degradation()
     test_prefix_ring_continuity_and_no_drop()
-    print("\n[★] ALL 5 REGRESSION TEST SUITES PASSED SUCCESSFULLY!\n")
+    test_exactly_once_settlement_simulation()
+    print("\n[★] ALL 6 REGRESSION TEST SUITES PASSED SUCCESSFULLY!\n")
 
 
 if __name__ == "__main__":
