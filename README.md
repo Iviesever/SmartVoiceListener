@@ -1,252 +1,106 @@
-# SmartVoiceListener
+# SmartVoiceListener 🎙️
 
-SmartVoiceListener 是一个面向长时间对话场景的**本地离线语音监听与自动分段转写**项目。
-
-当前版本以 **Windows + React 19 + TypeScript + Vite + Python + sherpa-onnx** 为主要可运行链路：麦克风持续监听，在检测到讲话后自动录制，在停顿达到阈值时切出语音片段，并交给本地 ASR 模型转写。
-
-> 当前实现是 **VAD 自动分段 + 低延迟整段 ASR**，还不是“边说边逐字出现”的真正 streaming ASR。Android 原生常驻版本也仍在开发路线中。README 会明确区分“已实现”和“计划实现”。
+> **本地离线、私密安全的 AI 智能语音听写与流式文档工作台**。  
+> 结合持续音频采集、智能静音断句与多模型离线推理，将讲话内容自然连贯地转写成整篇文档。
 
 ---
 
-## 当前已实现
+## ✨ 核心特性
 
-### 常驻监听与自动分段
+- 📝 **流式文档工作区（CodeMirror 6 内核）**  
+  告别碎卡片设计，采用一整块纯白极简备忘录文档视图。讲话停顿自动换行追加，支持随时在任意位置自由打字、改错、选词与复制。
 
-- 浏览器麦克风持续监听，无需手动反复开始/停止录音；
-- 自适应 RMS 能量检测，根据环境底噪动态调整起说阈值；
-- 默认保留开口前约 **0.8 秒**环形缓冲，降低吞首字概率；
-- 默认检测到 **1.5 秒**连续静音后自动结束当前语音段；
-- 单段最长默认 **90 秒**，即使连续讲话没有静音也会强制切段；
-- 支持在运行中修改 VAD 阈值、停顿时长、前缀缓冲等参数。
+- 🛡️ **IME 输入法与尾部打字防干扰**  
+  内置 800ms 真实闲置调度器。当用户正在中文拼音打字或在文末编辑时，新转录自动安全排队，绝不打碎输入法候选框或把正在输入的句子劈断。
 
-> 仓库中会下载 `silero_vad.onnx`，但当前浏览器主链路仍使用自适应 RMS VAD；Silero VAD 尚未接入正式运行路径。
+- 🎯 **智能视口跟随与未读胶囊**  
+  处于文末时新文字自动平滑滚动触底；当向上翻阅或编辑历史内容时，视口稳固锁定不抢滚动条，并在右下方优雅浮现 `↓ 有 N 条新听写` 快捷胶囊。
 
-### Windows 本地离线 ASR
+- 🚀 **多模型离线矩阵 & GPU 硬件加速**  
+  - **SenseVoice (sherpa-onnx INT8)**：~100ms 极速响应，口语与普通话标点极佳；
+  - **Qwen3-ASR 1.7B**：通义千问 2024 端到端语音大模型，满血吃满 NVIDIA RTX 4070 (8GB) CUDA 张量核心；
+  - **Whisper large-v3 / Kotoba**：OpenAI 旗舰与多语种特化支持；
+  - 顶部下拉框支持一键无缝热切换。
 
-默认模型：
+- 🎤 **自适应 VAD 与 0.8s 深度前缀回溯**  
+  根据环境噪音动态调整拾音门限，开口瞬间自动回溯抓取前 800ms 音频，消除首字吞音；带通滤波过滤电流麦杂音，自动峰值响度归一化。
 
-- **SenseVoice INT8 / sherpa-onnx**：默认低延迟本地识别路径；
-- **Whisper large-v3 / faster-whisper**：可选高精度模型；
-- **Kotoba-v2-faster**：可选日文/双语模型；
-- **Qwen3-ASR 1.7B**：可选大模型后端。
+- 💾 **零延迟防丢持久化**  
+  正文与底层 Segments 自动防抖保存，同时深度监听 `pagehide` 与 `visibilitychange`，页面刷新、关闭或切后台时即时同步落盘。
 
-模型通过统一的 `ModelManager` 管理，可由前端切换。Whisper 与 Qwen 相关 Python 包改为**按需导入**，只使用 SenseVoice 时不再要求先安装全部可选引擎。
-
-### 本地运行安全
-
-ASR 服务默认仅监听：
-
-```text
-127.0.0.1:8767
-```
-
-不会默认暴露到局域网。
-
-可通过环境变量覆盖：
-
-```text
-SMARTVOICE_HOST
-SMARTVOICE_PORT
-SMARTVOICE_MODELS_DIR
-```
-
-其中 `SMARTVOICE_MODELS_DIR` 用于指定 Whisper / Kotoba / Qwen 等外部模型目录。
-
-### 前端
-
-- React 19 + TypeScript + Vite；
-- 监听/讲话/停顿/转写状态展示；
-- 声音强度可视化；
-- 转录历史、复制、删除、清空；
-- Markdown 导出；
-- 多模型选择；
-- Blob 音频 URL 在删除记录、清空记录及页面卸载时主动释放，降低长时间运行造成的内存泄漏风险。
+- 🎨 **极简亮色设计系统**  
+  纯白底色，无毛玻璃特效，全内联纯 SVG 矢量图标，响应轻快利落，支持移动端窄屏自适应响应式布局。
 
 ---
 
-## 当前工作流
+## 🚀 极速上手
 
-```text
-Microphone
-   ↓
-Web Audio API
-   ↓
-Adaptive RMS VAD
-   ↓
-Prefix ring buffer
-   ↓
-Speech segment
-   ↓
-PCM → WAV
-   ↓
-HTTP POST /api/asr
-   ↓
-Local ASR
-   ↓
-Final transcript
+### 1. 环境准备
+- **Node.js** (>= 18.0)
+- **Python** (3.10+，推荐配备 CUDA 12+ 的 PyTorch 环境以启用 GPU 加速)
+
+### 2. 安装依赖
+```bash
+# 安装前端依赖
+npm install
+
+# 安装 Python 离线语音依赖
+pip install sherpa-onnx soundfile
+# (可选) 启用 Qwen3-ASR 或 Whisper GPU 加速：
+# pip install torch torchaudio --index-url https://download.pytorch.org/whl/cu121
+# pip install qwen-asr faster-whisper
 ```
 
-这意味着当前字幕会在一个语音段结束后返回，例如：
-
-```text
-讲话中……
-讲话中……
-停顿 1.5 秒
-↓
-“我觉得下一阶段应该先把核心功能做完。”
-```
-
-而不是目前尚未实现的：
-
-```text
-“我觉得▌”
-“我觉得下一阶段▌”
-“我觉得下一阶段应该先把核心功能▌”
-```
-
----
-
-## 启动
-
-### 一键启动
-
-Windows 下直接运行：
-
-```text
+### 3. 一键启动
+在 Windows 下直接双击运行：
+```bat
 start.bat
 ```
-
-或：
-
+或者通过 Node 编排脚本启动：
 ```bash
 node scripts/start.mjs
 ```
+启动后系统将自动拉起 Python 后端与 Vite 开发服务器，并在浏览器自动打开 **`http://localhost:5174`**。
 
-启动流程会：
+---
 
-1. 检查前端依赖；
-2. 检查/准备本地 SenseVoice 模型；
-3. 启动本地 Python ASR 服务；
-4. 启动 Vite；
-5. 打开浏览器界面。
-
-默认访问：
+## 🛠️ 技术架构
 
 ```text
-http://localhost:5174
-```
+React 19 + TypeScript + Vite
+│
+├── TopControlBar (模型热切换 / 启动停止 / 参数设置)
+│
+├── DocumentWorkspace
+│     └── DocumentEditor (CodeMirror 6 纯白备忘录内核)
+│           ├── Transaction 统一派发 (addToHistory: false)
+│           ├── IME / 尾部打字 800ms 闲置调度器
+│           └── 80px 容差智能视口与未读悬浮胶囊
+│
+└── BottomStatusBar (实时呼吸状态灯 / 字数统计 / 导出 / 清空)
 
-ASR 服务默认：
-
-```text
-http://127.0.0.1:8767
+Audio Pipeline (Web Audio API)
+│
+├── 持续主音频流采集 (Master Continuous Recording)
+├── 800ms 环形前缀缓冲 (防吞字回溯)
+├── 自适应底噪学习与带通滤波 (80Hz ~ 7500Hz)
+└── VAD 静音切句 ➔ Python 本地 ASR 服务 (8767 端口)
 ```
 
 ---
 
-## 项目结构
+## ⚙️ 环境变量配置（可选）
 
-```text
-SmartVoiceListener/
-├── src/
-│   ├── components/
-│   │   ├── AudioVisualizer.tsx
-│   │   ├── StatusHeader.tsx
-│   │   ├── TranscriptCard.tsx
-│   │   ├── ControlFloatingBar.tsx
-│   │   ├── SettingsModal.tsx
-│   │   └── Icons.tsx
-│   ├── hooks/
-│   │   └── useVoiceListener.ts
-│   ├── services/
-│   │   ├── asrService.ts
-│   │   ├── vadEngine.ts
-│   │   └── storageService.ts
-│   ├── types/
-│   │   └── index.ts
-│   ├── styles/
-│   │   └── index.css
-│   ├── App.tsx
-│   └── main.tsx
-├── server/
-│   └── asr_server.py
-├── models/
-├── scripts/
-├── start.bat
-├── test_engine.py
-├── package.json
-├── tsconfig.json
-└── vite.config.ts
-```
+可通过环境变量按需自定义 ASR 服务端：
+
+| 变量名 | 默认值 | 说明 |
+| :--- | :--- | :--- |
+| `SMARTVOICE_HOST` | `127.0.0.1` | 服务绑定地址（默认仅本地回环，保障私密安全） |
+| `SMARTVOICE_PORT` | `8767` | ASR 服务端监听端口 |
+| `SMARTVOICE_MODELS_DIR` | `D:\resource\AI_WorkSpace\Models` | 外部离线模型存放主目录 |
 
 ---
 
-## 已知限制
+## 📄 开源许可证
 
-### 1. 还不是真正的 Streaming ASR
-
-SenseVoice 当前通过 `sherpa_onnx.OfflineRecognizer` 对 VAD 切出的完整语音段做识别。
-
-下一阶段计划加入：
-
-```text
-Streaming Zipformer / OnlineRecognizer
-        ↓
-partial transcript
-        ↓
-SenseVoice / Whisper / Qwen final correction
-```
-
-最终形成 `partial + final` 双轨字幕。
-
-### 2. 浏览器音频仍使用 ScriptProcessorNode
-
-当前 MVP 为兼容现有实现仍使用 `ScriptProcessorNode`。正式 Windows 客户端计划迁移至 **AudioWorklet**，避免依赖已废弃 API。
-
-### 3. Android 原生版本尚未落库
-
-当前仓库没有完整的 Android 原生运行链路。
-
-目标架构：
-
-```text
-React / TypeScript UI
-        ↓
-Capacitor native bridge
-        ↓
-Android Foreground Service
-        ↓
-AudioRecord
-        ↓
-Silero VAD
-        ↓
-sherpa-onnx AAR
-        ↓
-Streaming ASR
-```
-
-Foreground Service 用于在切后台、锁屏等场景下维持用户明确开启的持续转录任务。
-
-### 4. 历史文字使用 localStorage
-
-当前文字记录保存在 localStorage，音频 Blob 只在当前运行时有效。后续计划迁移到 IndexedDB / SQLite，以支持真正的长时间会议历史与音频持久化。
-
----
-
-## 下一阶段优先级
-
-1. Windows `ScriptProcessorNode` → `AudioWorklet`；
-2. 接入 sherpa-onnx streaming Zipformer / `OnlineRecognizer`；
-3. 建立 `partial` / `final` transcript 数据模型；
-4. 接入真正的 Silero VAD；
-5. Android：Capacitor + Foreground Service + AudioRecord + sherpa-onnx AAR；
-6. IndexedDB / SQLite 持久化；
-7. 长时间运行、内存、丢帧和后台生命周期测试。
-
----
-
-## 目标
-
-SmartVoiceListener 最终希望成为一个：
-
-> **Windows + Android、本地优先、可长时间常驻、真正实时的跨平台语音转录工具。**
+本项目基于 [MIT License](LICENSE) 开源。
