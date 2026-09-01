@@ -23,12 +23,12 @@ export function useVoiceListener(options?: UseVoiceListenerOptions) {
   // 全局会话世代 (Session Epoch)，在清空、停止、新开启时递增
   const sessionEpochRef = useRef<number>(1);
   const currentSpeechEpochRef = useRef<number>(1);
-  // 并发 ASR 飞行中任务计数器，用于精确控制状态机切换
+  // 并发 ASR 飞行中任务计数器
   const inFlightAsrCountRef = useRef<number>(0);
 
   const engineRef = useRef<VadEngine | null>(null);
+  // 严格同步的 segmentsRef，完全不依赖 React render 时序
   const segmentsRef = useRef<TranscriptSegment[]>(segments);
-  segmentsRef.current = segments;
 
   const optionsRef = useRef(options);
   optionsRef.current = options;
@@ -60,10 +60,32 @@ export function useVoiceListener(options?: UseVoiceListenerOptions) {
   // Segments 变更防抖持久化 (500ms)
   useEffect(() => {
     const timer = setTimeout(() => {
-      saveSegments(segments);
+      saveSegments(segmentsRef.current);
     }, 500);
     return () => clearTimeout(timer);
   }, [segments]);
+
+  // 自闭环管理 pagehide 与 visibilitychange 立即落盘 Segments
+  useEffect(() => {
+    const handleImmediateFlush = () => {
+      saveSegments(segmentsRef.current);
+    };
+
+    const handleVisibilityChange = () => {
+      if (document.visibilityState === 'hidden') {
+        handleImmediateFlush();
+      }
+    };
+
+    window.addEventListener('pagehide', handleImmediateFlush);
+    document.addEventListener('visibilitychange', handleVisibilityChange);
+
+    return () => {
+      window.removeEventListener('pagehide', handleImmediateFlush);
+      document.removeEventListener('visibilitychange', handleVisibilityChange);
+      handleImmediateFlush();
+    };
+  }, []);
 
   // 页面卸载时安全清理：先递增 epoch 阻断飞出的 ASR 请求，再清理麦克风与所有 Blob URL
   useEffect(() => {
@@ -122,7 +144,6 @@ export function useVoiceListener(options?: UseVoiceListenerOptions) {
         return;
       }
 
-      // 关键修复：只有在确实有识别文本且成功入库时才按需创建 Object URL，避免空识别结果泄漏
       if (res.text && res.text.trim()) {
         const audioUrl = URL.createObjectURL(wavBlob);
         const segment: TranscriptSegment = {
@@ -137,15 +158,26 @@ export function useVoiceListener(options?: UseVoiceListenerOptions) {
           createdAt: Date.now(),
         };
 
-        setSegments((prev) => [...prev, segment]);
+        // 同步更新 segmentsRef，不依赖 React render 时序
+        setSegments((prev) => {
+          const next = [...prev, segment];
+          segmentsRef.current = next;
+          return next;
+        });
+
         optionsRef.current?.onTranscriptFinal?.(res.text.trim(), segment);
       }
     } catch (err: unknown) {
       console.error('ASR transcription failed:', err);
     } finally {
+      // 关键 Blocker 修复：旧 epoch 请求绝不触碰新 session 的计数器与状态机！
+      if (speechEpoch !== sessionEpochRef.current) {
+        return;
+      }
+
       inFlightAsrCountRef.current = Math.max(0, inFlightAsrCountRef.current - 1);
-      // 关键保护：只有当前仍是同一 session、引擎仍在运行且所有并发请求均已完成时才切回 LISTENING_SILENCE
-      if (speechEpoch === sessionEpochRef.current && engineRef.current && inFlightAsrCountRef.current === 0) {
+
+      if (engineRef.current && inFlightAsrCountRef.current === 0) {
         setState((current) => (current === 'TRANSCRIBING' ? 'LISTENING_SILENCE' : current));
       }
     }
@@ -165,7 +197,6 @@ export function useVoiceListener(options?: UseVoiceListenerOptions) {
 
       const engine = new VadEngine(vadConfig);
       engine.onSpeakingStart = () => {
-        // 在开口说话的一瞬间锁定当前 speech epoch
         currentSpeechEpochRef.current = sessionEpochRef.current;
         setState('SPEAKING_ACTIVE');
         setPauseCountdown(0);
@@ -199,7 +230,7 @@ export function useVoiceListener(options?: UseVoiceListenerOptions) {
 
   // 停止监听
   const stopListening = useCallback(() => {
-    sessionEpochRef.current += 1; // 终止当前所有 in-flight 任务的合法性
+    sessionEpochRef.current += 1;
     inFlightAsrCountRef.current = 0;
     if (engineRef.current) {
       engineRef.current.stop();
@@ -221,7 +252,7 @@ export function useVoiceListener(options?: UseVoiceListenerOptions) {
 
   // 清空文档与后台 Segments
   const resetWorkspace = useCallback(() => {
-    sessionEpochRef.current += 1; // 递增世代，彻底废弃已在队列或飞行中的所有请求
+    sessionEpochRef.current += 1;
     inFlightAsrCountRef.current = 0;
     setSegments((prev) => {
       prev.forEach((s) => {
@@ -229,6 +260,7 @@ export function useVoiceListener(options?: UseVoiceListenerOptions) {
           URL.revokeObjectURL(s.audioBlobUrl);
         }
       });
+      segmentsRef.current = [];
       return [];
     });
   }, []);

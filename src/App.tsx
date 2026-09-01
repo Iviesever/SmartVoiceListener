@@ -5,7 +5,7 @@ import { DocumentEditor, DocumentEditorHandle } from './components/DocumentEdito
 import { UnreadTranscriptAnchor } from './components/DocumentEditor/UnreadTranscriptAnchor';
 import { SettingsModal } from './components/SettingsModal';
 import { CopyIcon, CheckIcon, DownloadIcon, TrashIcon } from './components/Icons';
-import { loadSavedDocument, saveDocumentContent, saveSegments } from './services/storageService';
+import { loadSavedDocument, saveDocumentContent } from './services/storageService';
 
 export default function App() {
   const editorRef = useRef<DocumentEditorHandle | null>(null);
@@ -44,7 +44,6 @@ export default function App() {
 
   const {
     state,
-    segments,
     volume,
     pauseCountdown,
     vadConfig,
@@ -61,17 +60,13 @@ export default function App() {
     onTranscriptFinal: handleTranscriptFinal,
   });
 
-  const latestSegmentsRef = useRef(segments);
-  latestSegmentsRef.current = segments;
-
-  // 关键：监听 pagehide 与 visibilitychange，确保在刷新/关闭/切后台时立刻落盘，消除 debounce 丢数据窗口
+  // 监听 pagehide 与 visibilitychange，在刷新/关闭/切后台时同步立即落盘文档
   useEffect(() => {
     const handleImmediateFlush = () => {
       if (saveTimerRef.current) {
         clearTimeout(saveTimerRef.current);
       }
       saveDocumentContent(latestDocRef.current);
-      saveSegments(latestSegmentsRef.current);
     };
 
     const handleVisibilityChange = () => {
