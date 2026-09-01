@@ -4,6 +4,12 @@ import { VadEngine, DEFAULT_VAD_CONFIG, pcmToWavBlob } from '../services/vadEngi
 import { transcribeAudioBlob, checkAsrHealth, fetchAvailableModels, switchActiveModel } from '../services/asrService';
 import { loadTranscripts, saveTranscripts } from '../services/storageService';
 
+function revokeAudioUrl(item: TranscriptItem | undefined) {
+  if (item?.audioBlobUrl?.startsWith('blob:')) {
+    URL.revokeObjectURL(item.audioBlobUrl);
+  }
+}
+
 export function useVoiceListener() {
   const [state, setState] = useState<ListenerState>('IDLE');
   const [transcripts, setTranscripts] = useState<TranscriptItem[]>(() => loadTranscripts());
@@ -17,6 +23,7 @@ export function useVoiceListener() {
   const [isSwitchingModel, setIsSwitchingModel] = useState<boolean>(false);
 
   const engineRef = useRef<VadEngine | null>(null);
+  const transcriptsRef = useRef<TranscriptItem[]>(transcripts);
 
   // 定期检测本地 ASR 服务健康度与模型列表
   const refreshServerStatus = useCallback(async () => {
@@ -35,15 +42,27 @@ export function useVoiceListener() {
   }, []);
 
   useEffect(() => {
-    refreshServerStatus();
-    const timer: ReturnType<typeof setInterval> = setInterval(refreshServerStatus, 5000);
+    void refreshServerStatus();
+    const timer: ReturnType<typeof setInterval> = setInterval(() => {
+      void refreshServerStatus();
+    }, 5000);
     return () => clearInterval(timer);
   }, [refreshServerStatus]);
 
-  // 保存记录
+  // 保存文字记录；Blob URL 仅属于当前运行时，不写入 localStorage。
   useEffect(() => {
+    transcriptsRef.current = transcripts;
     saveTranscripts(transcripts);
   }, [transcripts]);
+
+  // 页面卸载时释放麦克风以及所有仍存活的 Blob URL，避免长时间运行/热重载后的资源泄漏。
+  useEffect(() => {
+    return () => {
+      engineRef.current?.stop();
+      engineRef.current = null;
+      transcriptsRef.current.forEach(revokeAudioUrl);
+    };
+  }, []);
 
   // 切换 ASR 识别模型
   const handleSwitchModel = useCallback(async (modelId: string) => {
@@ -68,8 +87,6 @@ export function useVoiceListener() {
     setPauseCountdown(0);
 
     const wavBlob = pcmToWavBlob(pcmData, vadConfig.sampleRate);
-    const audioUrl = URL.createObjectURL(wavBlob);
-
     const now = new Date();
     const timeString = `${String(now.getHours()).padStart(2, '0')}:${String(now.getMinutes()).padStart(2, '0')}:${String(now.getSeconds()).padStart(2, '0')}`;
     const itemId = `trans-${Date.now()}-${Math.random().toString(36).substring(2, 7)}`;
@@ -83,7 +100,7 @@ export function useVoiceListener() {
           timeString,
           text: res.text,
           durationMs,
-          audioBlobUrl: audioUrl,
+          audioBlobUrl: URL.createObjectURL(wavBlob),
           modelName: activeModel,
         };
         setTranscripts((prev) => [newItem, ...prev]);
@@ -97,7 +114,7 @@ export function useVoiceListener() {
         timeString,
         text: `[转写失败] ${errMsg}`,
         durationMs,
-        audioBlobUrl: audioUrl,
+        audioBlobUrl: URL.createObjectURL(wavBlob),
         modelName: activeModel,
       };
       setTranscripts((prev) => [errorItem, ...prev]);
@@ -125,7 +142,7 @@ export function useVoiceListener() {
         setPauseCountdown(remainingMs);
       };
       engine.onSpeakingEnd = (pcm, dur) => {
-        handleSpeakingEnd(pcm, dur);
+        void handleSpeakingEnd(pcm, dur);
       };
       engine.onVolumeUpdate = (vol) => {
         setVolume(vol);
@@ -155,21 +172,28 @@ export function useVoiceListener() {
   // 切换监听状态
   const toggleListening = useCallback(() => {
     if (state === 'IDLE') {
-      startListening();
+      void startListening();
     } else {
       stopListening();
     }
   }, [state, startListening, stopListening]);
 
-  // 删除单条记录
+  // 删除单条记录，同时释放当前运行时音频 URL。
   const deleteTranscript = useCallback((id: string) => {
-    setTranscripts((prev) => prev.filter((item) => item.id !== id));
+    setTranscripts((prev) => {
+      const target = prev.find((item) => item.id === id);
+      revokeAudioUrl(target);
+      return prev.filter((item) => item.id !== id);
+    });
   }, []);
 
   // 清空所有记录
   const clearAllTranscripts = useCallback(() => {
     if (window.confirm('确定要清空所有已转写的语音记录吗？')) {
-      setTranscripts([]);
+      setTranscripts((prev) => {
+        prev.forEach(revokeAudioUrl);
+        return [];
+      });
     }
   }, []);
 
@@ -177,9 +201,7 @@ export function useVoiceListener() {
   const updateVadConfig = useCallback((newConfig: Partial<VadConfig>) => {
     setVadConfig((prev) => {
       const merged = { ...prev, ...newConfig };
-      if (engineRef.current) {
-        engineRef.current.updateConfig(merged);
-      }
+      engineRef.current?.updateConfig(merged);
       return merged;
     });
   }, []);
