@@ -136,7 +136,7 @@ export const DocumentEditor = forwardRef<DocumentEditorHandle, DocumentEditorPro
       }
     }, [scrollToBottom]);
 
-    // 关键修复：统一的真实 Idle 调度器（必须距离用户最后一次输入 >= 800ms 才允许 flush）
+    // 优化：首次调度即按剩余时间 (800 - elapsed) 计算，真正做到“自最后一次敲键起满 800ms 就追加”
     const schedulePendingFlushAfterIdle = useCallback(() => {
       if (tailEditTimerRef.current) {
         clearTimeout(tailEditTimerRef.current);
@@ -163,7 +163,9 @@ export const DocumentEditor = forwardRef<DocumentEditorHandle, DocumentEditorPro
         flushPendingTranscripts();
       };
 
-      tailEditTimerRef.current = setTimeout(tryFlush, 800);
+      const elapsed = Date.now() - lastUserEditAtRef.current;
+      const initialDelay = Math.max(0, 800 - elapsed);
+      tailEditTimerRef.current = setTimeout(tryFlush, initialDelay);
     }, [flushPendingTranscripts]);
 
     // 判断用户是否正在文档尾部活跃打字
@@ -265,7 +267,7 @@ export const DocumentEditor = forwardRef<DocumentEditorHandle, DocumentEditorPro
       unreadCountRef.current = 0;
       onUnreadCountChangeRef.current?.(0);
 
-      // 关键：通过 view.setState 赋予全新空 state，彻底重置 Undo 历史栈
+      // 通过 view.setState 赋予全新空 state，彻底重置 Undo 历史栈
       const emptyState = createNewEditorState('');
       view.setState(emptyState);
 
@@ -327,7 +329,6 @@ export const DocumentEditor = forwardRef<DocumentEditorHandle, DocumentEditorPro
 
       const handleCompositionEnd = () => {
         isComposingRef.current = false;
-        // 关键：composition 结束后同样走统一的 Idle 调度器，绝不立刻抢写
         schedulePendingFlushAfterIdle();
       };
 
